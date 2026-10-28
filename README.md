@@ -44,9 +44,6 @@ CIFAR-10/100 ──冻结 EdgeVAE 编码──> 潜空间 [N,16,8,8]
 | `exp_refine.py` | K-means 质心 vs 梯度精炼 |
 | `exp_energy_methods.py` | 分阶段 FLOPs / 能耗 / 传输时延 |
 | `plot_acc_loss.py` | 消融 loss 图 + 共享绘图工具函数 |
-| `figures/` | 论文图输出（pdf + png，运行时生成，**不入库**） |
-| `results/` | 实验结果 JSON/CSV（运行时生成，**不入库**） |
-| `data/ pt/ checkpoints/ logs/` | 数据集、潜变量产物、权重、日志（体积大，**不入库**） |
 
 运行产物路径由 `config.py` 统一管理；设置环境变量 `DATASET=cifar100` 时，
 `pt/ results/ checkpoints/ logs/` 会自动隔离到对应子目录。
@@ -89,7 +86,7 @@ python exp_method_compare.py --multi_backbone   # 4 方法 × 4 backbone 网格�
 
 ### 论文图 ↔ 命令
 
-| 产出（`figures/`） | 命令 |
+| 产出 | 命令 |
 |---|---|
 | `accuracy_compression_tradeoff.*` | `python exp_ipc.py --auto` |
 | `ablation_vae_cls_loss_train.*` | `python exp_ablation.py` 后执行 `python plot_acc_loss.py` |
@@ -102,39 +99,8 @@ python exp_method_compare.py --multi_backbone   # 4 方法 × 4 backbone 网格�
 
 ---
 
-## 5. 关键口径（写论文必须遵守）
 
-1. 下游训练统一 50 epoch、Adam `lr=1e-3`、cosine 衰减、3 seeds；
-   分类头前加 `Dropout(0.3)`，backbone 参数量对齐 ~28–32K。
-2. 报告的精度一律取**最后一个 epoch**，不按测试曲线峰值挑 epoch。
-3. 能耗 `E = FLOPs × 1e-11 J/FLOP`，训练 FLOPs ≈ 前向 × 3；
-   传输 `latency = bytes×8 / 带宽`，`energy = bits × 1e-7 J/bit`。
-4. 推理只计下游分类器前向，**不重复计 EdgeVAE 编码**（编码已计入蒸馏产出阶段）。
-5. CIFAR-100 每类仅 500 张训练图，IPC 不得超过 491；`exp_ipc.py` 需自适应 `NUM_CLASSES`。
 
-更多公式与硬件常数见 [METRICS.md](METRICS.md)。
-
----
-
-## 6. 仓库与 Git
-
-仓库已通过 `.gitignore` 排除 `data/`、`pt/`、`checkpoints/`、`logs/`、`results/`、`figures/`
-以及缓存与 IDE 文件；这些产物需在本地按 §4 的命令重新生成。
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: latent dataset distillation for edge deployment"
-git branch -M main
-git remote add origin https://github.com/passer-by-a/-Data-Distillation-for-Edge-Computing.git
-git push -u origin main
 ```
 
 ---
-
-## 7. 已知注意事项
-
-- 潜空间维度固定 `16×8×8`；`128×4×4` 的旧 VAE 口径已废弃。
-- ConvNeXt 在小规模潜变量数据上过拟合严重，已从下游模型中移除。
-- `PixelResNet` 未注册进 `BACKBONES`，仅在像素基线实验中使用。
-- 复现实验前请确认 `pt/` 与 `checkpoints/` 中的产物存在，否则需先执行 §4 的步骤 1–2。

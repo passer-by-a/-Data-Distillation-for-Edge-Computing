@@ -1,0 +1,25 @@
+# ===== 数据、模型权重、日志、结果与图（均不入库）=====
+data/
+pt/
+checkpoints/
+logs/
+results/
+figures/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== 编辑器 / 系统 =====
+.trae/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.log
+*.tmp
+*.bak

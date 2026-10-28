@@ -8,7 +8,7 @@ EdgeVAE (边缘潜空间, 16ch × 8×8, 3× 压缩) + 训练入口
 
 分类头: conv(latent→64, 3×3) + GAP + Linear → 塑造潜空间类判别性
 
-结构 (权重 key 与命名精确对应, 勿随意改名, 否则无法加载已有 ckpt):
+结构 :
   Encoder: conv1(3→64, 3×3) → down×2 [ResBlock(64) + 4×4s2 conv + BN] → mid[ResBlock×2] → 1×1 → mu/logvar
   Decoder: in_conv(1×1, latent→64) → mid[ResBlock×2] → up×2 [ConvT 4×4s2 + BN + ResBlock(64)] → out ResBlock(64→32) → 3×3 → 3ch (tanh)
   ResBlock: conv1/bn1/conv2/bn2 + identity/1×1 shortcut

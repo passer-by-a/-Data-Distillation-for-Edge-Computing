@@ -42,9 +42,6 @@ CIFAR-10/100 ──冻结 EdgeVAE 编码──> 潜空间 [N,16,8,8]
 | `exp_refine.py` | K-means 质心 vs 梯度精炼 |
 | `exp_energy_methods.py` | 分阶段 FLOPs / 能耗 / 传输时延 |
 | `plot_acc_loss.py` | 消融 loss 图 + 共享绘图工具函数 |
-| `figures/` | 论文图输出（pdf + png，运行时生成，**不入库**） |
-| `results/` | 实验结果 JSON/CSV（运行时生成，**不入库**） |
-| `data/ pt/ checkpoints/ logs/` | 数据集、潜变量产物、权重、日志（体积大，**不入库**） |
 
 运行产物路径由 `config.py` 统一管理；设置环境变量 `DATASET=cifar100` 时，
 `pt/ results/ checkpoints/ logs/` 会自动隔离到对应子目录。

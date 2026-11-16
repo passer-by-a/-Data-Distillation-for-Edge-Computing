@@ -1,0 +1,76 @@
+protocol_version: vae_streaming_v1
+dataset: cifar10
+num_classes: 10
+val_ratio: 0.02
+split_seed: 42
+feature_dim: 1024
+latent_dim: 16
+base_channels: 64
+
+stream:
+  scenario: iid
+  initial_fraction: 0.20
+  num_rounds: 5
+  shuffle_seed: 42
+  class_balanced_initial: true
+
+vae:
+  online_update: true
+  initial_epochs: 30
+  steps_per_round: 150
+  batch_size: 128
+  lr: 0.001
+  beta: 1.0e-4
+  cls_lambda: 0.1
+  replay_enabled: true
+  replay_ratio: 0.25
+  stability_enabled: false
+  lambda_stab: 0.0
+  augment: true
+  seed: 42
+
+memory:
+  replay_strategy: class_balanced
+  raw_replay_capacity: 1000
+  representative_budget: 980
+  representative_init: kmeans
+
+alignment:
+  method: diagonal_affine
+  anchor_count: 200
+  max_scale: 3.0
+
+distillation:
+  method: dm
+  patch_optimize: synced_only   # synced_only / all
+  updates_per_class: 20
+  lr: 0.01
+  weight_decay: 0.0
+  lambda_mean: 1.0
+  lambda_var: 1.0
+  lambda_anchor: 0.01
+  seed: 42
+
+communication:
+  mode: full_sync
+  quantization: int8
+  patch_fraction: 0.10
+
+cloud:
+  head: mlp
+  incremental_training: true
+  steps_per_round: 200
+  lr: 0.001
+  wd: 0.0001
+  batch: 256
+  seed: 0
+  val_mode: external
+  epochs: 50
+
+evaluation:
+  per_round: true
+  test_int8: true
+
+results_dir: vae_streaming/results
+checkpoints_dir: vae_streaming/checkpoints
+figures_dir: vae_streaming/figures

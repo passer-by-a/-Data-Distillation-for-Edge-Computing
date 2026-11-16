@@ -1,0 +1,53 @@
+dataset: cifar100
+num_classes: 100
+val_ratio: 0.02
+split_seed: 42
+vae_ckpt: checkpoints/cifar100/autoencoder_edge_s8_c16.pt
+
+feature:
+  latent: mu
+  batch: 256
+
+cache_dir: vae_bdm/cache
+results_dir: vae_bdm/results
+figures_dir: vae_bdm/figures
+
+compression_ratios: [10, 20, 50, 100]
+
+baseline:
+  kmeans_n_init: 1
+  kmeans_max_iter: 100
+  seed: 42
+
+dm:
+  init: kmeans
+  iterations: 3000
+  real_batch_size: 256
+  lr: 0.01
+  weight_decay: 0.0
+  lambda_mean: 1.0
+  lambda_var: 1.0
+  lambda_anchor: 0.0
+  lambda_diversity: 0.0
+  use_covariance: false
+  cov_dim: 64
+  lambda_cov: 1.0
+  eval_every: 500
+  val_epochs: 50
+  seed: 42
+
+cloud:
+  head: mlp
+  epochs: 200
+  lr: 0.001
+  wd: 0.0001
+  batch: 256
+  val_frac: 0.1
+  seeds: [0, 1, 2]
+
+quant:
+  modes: [fp32, fp16, int8]
+
+payload:
+  label_bytes: 2
+  bandwidth_mbps: 10.0

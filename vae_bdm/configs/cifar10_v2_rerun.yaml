@@ -1,0 +1,67 @@
+protocol_version: vae_bdm_v2
+dataset: cifar10
+num_classes: 10
+val_ratio: 0.02
+split_seed: 42
+vae_ckpt: checkpoints/autoencoder_edge_s8_c16.pt
+
+feature:
+  latent: mu
+  batch: 256
+
+cache_dir: vae_bdm/cache
+results_dir: vae_bdm/results/v2_rerun/cifar10
+figures_dir: vae_bdm/figures/v2_rerun/cifar10
+
+compression_ratios: [10, 20, 50, 100]
+
+baseline:
+  kmeans_n_init: 1
+  kmeans_max_iter: 100
+  seed: 42
+  moment_eps: 1.0e-6
+  moment_max_scale: 3.0
+
+dm:
+  init: kmeans
+  updates_per_class: 300
+  real_batch_size: 256
+  lr: 0.01
+  weight_decay: 0.0
+  lambda_mean: 1.0
+  lambda_var: 1.0
+  lambda_anchor: 0.0
+  lambda_diversity: 0.0
+  use_covariance: false
+  cov_dim: 64
+  lambda_cov: 1.0
+  eval_every: 500
+  log_every: 50
+  save_every: 0
+  seed: 42
+
+bdm_validation:
+  head: mlp
+  epochs: 50
+  seed: 0
+  eval_every: 500
+  selection: val
+
+cloud:
+  head: mlp
+  epochs: 200
+  lr: 0.001
+  wd: 0.0001
+  batch: 256
+  val_mode: external
+  training_budget:
+    mode: fixed_epochs
+    epochs: 200
+  seeds: [0, 1, 2]
+
+quant:
+  modes: [fp32, fp16, int8]
+
+payload:
+  label_bytes: 2
+  bandwidth_mbps: 10.0

@@ -8,9 +8,7 @@ from collections import defaultdict
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ORDER = ["frozen_stream_dm", "online_naive_dm", "online_replay_dm",
-         "online_replay_align_dm", "online_moment", "online_kmeans",
-         "online_herding", "online_reservoir", "full_method"]
+ORDER = ["online_kmeans", "online_moment", "dm"]
 
 
 def load_all(results_dir):
@@ -92,10 +90,12 @@ def aggregate(objs, scenario, methods=None, append_extra=True):
     return rows
 
 
-def write_markdown(objs, out_path, dataset="cifar100"):
+def write_markdown(objs, out_path, dataset="cifar100", rounds=5, note=None):
     lines = [f"# {dataset} Streaming 结果汇总", "",
-             "> 5 轮，Initial Base 20%，代表预算 980（最终 50:1），INT8。"
+             f"> {rounds} 轮，Initial Base 20%，代表预算 980（最终 50:1），INT8。"
              " 数值为均值±标准差（种子 42/43/44）。", ""]
+    if note:
+        lines += [f"> {note}", ""]
     iid = aggregate(objs, "iid", methods=ORDER, append_extra=False)
     lines += ["## 1. IID", "",
               "| 方法 | 种子 | 初始 | 最终 | 在线平均 | 最终 F1 | INT8 | 累计通信 | 方差比 | 对齐误差 |",
@@ -121,15 +121,19 @@ def write_markdown(objs, out_path, dataset="cifar100"):
     for r in ls:
         lines.append(f"| {r['method']} | {_fmt(r['final'])} | {_fmt(r.get('current'))} | "
                      f"{_fmt(r.get('historical'))} | {r['comm_kb']:.0f} KB |")
+    if not ls:
+        lines.append("| （无结果，待重跑） | — | — | — | — |")
     cs = aggregate(objs, "covariate_shift")
     lines += ["", "## 3. Covariate Shift", "",
               "| 方法 | 原域 | 当前域 | 累计通信 |", "|---|---|---|---|"]
     for r in cs:
         lines.append(f"| {r['method']} | {_fmt(r.get('clean'))} | "
                      f"{_fmt(r.get('shifted'))} | {r['comm_kb']:.0f} KB |")
+    if not cs:
+        lines.append("| （无结果，待重跑） | — | — | — |")
     off = [o for o in objs if o["summary"].get("scenario") == "offline_non_causal"]
     if off:
-        lines += ["", "## 4. 非因果离线参考（全量 49k 一次性 Batch DM）", "",
+        lines += ["", "## 4. 非因果离线参考（全量 49k 一次性基线）", "",
                   "| 参考 | 方法 | 编码器可访问数据 | 归一化 | 最终 |",
                   "|---|---|---|---|---|"]
         for o in sorted(off, key=lambda x: x["summary"].get(
@@ -146,19 +150,29 @@ def write_markdown(objs, out_path, dataset="cifar100"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default="vae_streaming/results")
-    ap.add_argument("--dataset", default=None,
-                    help="cifar10 / cifar100；缺省则汇总全部")
+    ap.add_argument("--dataset", required=True, choices=["cifar10", "cifar100"],
+                    help="必须指定数据集，避免把不同数据集混进同一张表")
+    ap.add_argument("--rounds", type=int, default=5,
+                    help="只统计该轮数的结果（长流实验用 392）")
+    ap.add_argument("--tag", default=None,
+                    help="只统计方法名以该后缀结尾的结果，并在表中去掉该后缀")
+    ap.add_argument("--note", default=None, help="追加到表头的说明")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     objs = load_all(os.path.join(ROOT, args.results))
-    if args.dataset:
+    objs = [o for o in objs
+            if o["summary"].get("dataset") == args.dataset
+            and (o["summary"].get("scenario") == "offline_non_causal"
+                 or o["summary"].get("num_rounds") == args.rounds)]
+    if args.tag:
         objs = [o for o in objs
-                if o["summary"].get("dataset") == args.dataset]
-        out = args.out or f"vae_streaming/results/{args.dataset}/main_table.md"
-    else:
-        out = args.out or "vae_streaming/results/main_table.md"
+                if o["summary"]["method"].endswith(args.tag)]
+        for o in objs:
+            o["summary"]["method"] = o["summary"]["method"][:-len(args.tag)]
+    out = args.out or f"vae_streaming/results/{args.dataset}/main_table.md"
     p = os.path.join(ROOT, out)
-    write_markdown(objs, p, dataset=args.dataset or "CIFAR-100/10")
+    write_markdown(objs, p, dataset=args.dataset, rounds=args.rounds,
+                   note=args.note)
     print(open(p).read())
 
 

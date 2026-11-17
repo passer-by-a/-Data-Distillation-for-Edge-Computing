@@ -1,13 +1,11 @@
-"""Online Coreset 对照: Reservoir / Online K-means / Online Herding
+"""Online Coreset 对照: Online K-means
 
-三者与 Streaming DM 共享同一代表预算、同一固定补丁更新接口。
+与 Streaming DM 共享同一代表预算、同一固定补丁更新接口。
 """
 import time
 
 import numpy as np
 import torch
-
-from vae_bdm.baselines import herding_select
 
 
 class _BaseCoreset:
@@ -48,65 +46,12 @@ class _BaseCoreset:
                 "seed": self.seed, "rng_state": self.rng.get_state()}
 
     @classmethod
-    def from_state_dict(cls, st, kind="reservoir"):
-        cls_map = {"reservoir": ReservoirCoreset,
-                   "kmeans": OnlineKMeans, "herding": OnlineHerding}
+    def from_state_dict(cls, st, kind="kmeans"):
+        cls_map = {"kmeans": OnlineKMeans}
         obj = cls_map[kind](st["features"], st["labels"], st["quotas"],
                             dim=st["dim"], seed=st["seed"])
         obj.features = st["features"].clone()
         obj.rng.set_state(st["rng_state"])
-        return obj
-
-
-class ReservoirCoreset(_BaseCoreset):
-    """逐类 reservoir sampling；代表特征是真实历史特征。"""
-
-    def __init__(self, features, labels, quotas, dim=1024, seed=0):
-        super().__init__(features, labels, quotas, dim, seed)
-        self.seen = np.zeros(self.num_classes, dtype=np.int64)
-
-    def update(self, features, labels, round_idx=0, allowed_idx=None):
-        t0 = time.time()
-        features = torch.as_tensor(features).float().cpu()
-        labels = torch.as_tensor(labels).long().cpu()
-        allowed = self._allowed_mask(allowed_idx)
-        n_replaced = 0
-        for c in range(self.num_classes):
-            a, b = self.slices[c]
-            z = features[labels == c]
-            if len(z) == 0:
-                continue
-            if allowed is None:
-                slots = torch.arange(b - a)
-            else:
-                slots = torch.where(allowed[a:b])[0]
-            if len(slots) == 0:
-                continue
-            for j in range(len(z)):
-                self.seen[c] += 1
-                if self.seen[c] <= len(slots):
-                    pos = int(slots[int(self.seen[c]) - 1])
-                else:
-                    k = int(self.rng.randint(0, int(self.seen[c])))
-                    if k >= len(slots):
-                        continue
-                    pos = int(slots[k])
-                self.features[a + pos] = z[j]
-                n_replaced += 1
-        return {"features": self.features.clone(),
-                "info": {"method": "reservoir", "round": int(round_idx),
-                         "n_replaced": int(n_replaced),
-                         "sec": time.time() - t0}}
-
-    def state_dict(self):
-        st = super().state_dict()
-        st["seen"] = self.seen.copy()
-        return st
-
-    @classmethod
-    def from_state_dict(cls, st, kind="reservoir"):
-        obj = super().from_state_dict(st, kind="reservoir")
-        obj.seen = np.asarray(st["seen"]).copy()
         return obj
 
 
@@ -166,90 +111,7 @@ class OnlineKMeans(_BaseCoreset):
         return obj
 
 
-class OnlineHerding(_BaseCoreset):
-    """有界候选池 + 每轮 herding 重选；候选池容量 = quota × pool_factor。"""
-
-    def __init__(self, features, labels, quotas, dim=1024, seed=0,
-                 pool_factor=4):
-        super().__init__(features, labels, quotas, dim, seed)
-        self.pool_factor = int(pool_factor)
-        self.pools = [[] for _ in range(self.num_classes)]
-        for c, (a, b) in self.slices.items():
-            self.pools[c] = [self.features[i].clone() for i in range(a, b)]
-        self.pool_seen = np.zeros(self.num_classes, dtype=np.int64)
-        self.replacements = 0
-
-    def align(self, alignment):
-        for c in range(self.num_classes):
-            if self.pools[c]:
-                self.pools[c] = [alignment.apply(z.unsqueeze(0))[0]
-                                 for z in self.pools[c]]
-        super().align(alignment)
-        return self
-
-    def update(self, features, labels, round_idx=0, allowed_idx=None):
-        t0 = time.time()
-        features = torch.as_tensor(features).float().cpu()
-        labels = torch.as_tensor(labels).long().cpu()
-        allowed = self._allowed_mask(allowed_idx)
-        for c in range(self.num_classes):
-            z = features[labels == c]
-            if len(z) == 0:
-                continue
-            cap = max(self.quotas[c], self.quotas[c] * self.pool_factor)
-            pool = self.pools[c]
-            for j in range(len(z)):
-                self.pool_seen[c] += 1
-                if len(pool) < cap:
-                    pool.append(z[j])
-                else:
-                    k = int(self.rng.randint(0, int(self.pool_seen[c])))
-                    if k < cap:
-                        pool[k] = z[j]
-                        self.replacements += 1
-        for c in range(self.num_classes):
-            a, b = self.slices[c]
-            pool = self.pools[c]
-            if not pool:
-                continue
-            sel = herding_select(torch.stack(pool).numpy(), b - a)
-            new = torch.stack([pool[i] for i in sel], 0)
-            if allowed is not None:
-                m = allowed[a:b]
-                self.features[a:b][m] = new[m]
-            else:
-                self.features[a:b] = new
-        return {"features": self.features.clone(),
-                "info": {"method": "online_herding", "round": int(round_idx),
-                         "pool_sizes": [len(p) for p in self.pools],
-                         "replacements": int(self.replacements),
-                         "sec": time.time() - t0}}
-
-    def state_dict(self):
-        st = super().state_dict()
-        st["pools"] = [[z.clone() for z in p] for p in self.pools]
-        st["pool_factor"] = self.pool_factor
-        st["pool_seen"] = self.pool_seen.copy()
-        st["replacements"] = self.replacements
-        return st
-
-    @classmethod
-    def from_state_dict(cls, st, kind="herding"):
-        obj = cls(st["features"], st["labels"], st["quotas"], dim=st["dim"],
-                  seed=st["seed"], pool_factor=st["pool_factor"])
-        obj.features = st["features"].clone()
-        obj.pools = [[z.clone() for z in p] for p in st["pools"]]
-        obj.pool_seen = np.asarray(st["pool_seen"]).copy()
-        obj.replacements = int(st["replacements"])
-        obj.rng.set_state(st["rng_state"])
-        return obj
-
-
 def build_coreset(kind, features, labels, quotas, dim=1024, seed=0):
-    if kind == "reservoir":
-        return ReservoirCoreset(features, labels, quotas, dim, seed)
     if kind == "kmeans":
         return OnlineKMeans(features, labels, quotas, dim, seed)
-    if kind == "herding":
-        return OnlineHerding(features, labels, quotas, dim, seed)
     raise ValueError(f"未知 coreset: {kind}")

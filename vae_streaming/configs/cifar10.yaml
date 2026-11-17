@@ -47,7 +47,6 @@ distillation:
   lr: 0.01
   weight_decay: 0.0
   lambda_mean: 1.0
-  lambda_var: 1.0
   lambda_anchor: 0.01
   seed: 42
 

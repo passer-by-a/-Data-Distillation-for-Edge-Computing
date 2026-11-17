@@ -156,7 +156,8 @@ def train_initial_vae(vae, images, labels, cfg, device="cuda", verbose=True):
     t0 = time.time()
     for ep in range(1, int(vcfg["initial_epochs"]) + 1):
         perm = torch.randperm(n)
-        agg = {"rec": 0.0, "kl": 0.0, "ce": 0.0, "loss": 0.0}
+        # 先收集标量、epoch 末一次汇总，避免每 batch 触发 host 同步
+        hist = {k: [] for k in ("rec", "kl", "ce", "loss")}
         nb = 0
         for i in range(0, n, bs):
             idx = perm[i:i + bs]
@@ -171,11 +172,12 @@ def train_initial_vae(vae, images, labels, cfg, device="cuda", verbose=True):
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            agg["loss"] += float(loss.detach())
+            hist["loss"].append(loss.detach())
             for k, v in parts.items():
-                agg[k] += float(v)
+                hist[k].append(v.detach())
             nb += 1
-        row = {k: v / max(1, nb) for k, v in agg.items()}
+        row = {k: (float(torch.stack(v).double().sum()) / max(1, nb)
+                   if v else 0.0) for k, v in hist.items()}
         row["epoch"] = ep
         log.append(row)
         if verbose and (ep % 10 == 0 or ep == int(vcfg["initial_epochs"])):
@@ -213,7 +215,8 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
     lam_s = float(vcfg.get("lambda_stab", 0.0)) if stability else 0.0
 
     g = torch.Generator().manual_seed(int(vcfg.get("seed", 42)) + round_idx)
-    agg = {"rec": 0.0, "kl": 0.0, "ce": 0.0, "stab": 0.0, "loss": 0.0}
+    # 先收集标量、结束时一次汇总，避免每 step 触发 host 同步
+    hist = {k: [] for k in ("rec", "kl", "ce", "stab", "loss")}
     t0 = time.time()
 
     for _ in range(steps):
@@ -243,12 +246,14 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
         loss.backward()
         opt.step()
 
-        agg["loss"] += float(loss.detach())
-        agg["stab"] += float(stab.detach()) if stability else 0.0
+        hist["loss"].append(loss.detach())
+        if stability:
+            hist["stab"].append(stab.detach())
         for k, v in parts.items():
-            agg[k] += float(v)
+            hist[k].append(v.detach())
 
-    row = {k: v / max(1, steps) for k, v in agg.items()}
+    row = {k: (float(torch.stack(v).double().sum()) / max(1, steps)
+               if v else 0.0) for k, v in hist.items()}
     row.update({"steps": steps, "train_sec": time.time() - t0,
                 "replay_ratio": float(n_rep / max(1, bs)),
                 "n_replay_in_batch": int(n_rep),

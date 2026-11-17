@@ -1,7 +1,6 @@
-"""确定性配额与静态 Coreset 基线: Full/Random/Mean/K-means/Herding
+"""确定性配额与静态 Coreset 基线: Full / Random / K-means
 
-另含解析式矩校正基线（无需梯度迭代）:
-  kmeans_moment / random_moment
+另含解析式矩校正基线（无需梯度迭代）: kmeans_moment
 """
 import time
 
@@ -95,22 +94,6 @@ def allocate_quotas(labels, M, num_classes):
     return q
 
 
-def herding_select(z, n):
-    z = np.asarray(z, dtype=np.float32)
-    mu = z.mean(0)
-    acc = np.zeros(z.shape[1], dtype=np.float64)
-    remain = np.arange(len(z))
-    sel = []
-    for t in range(n):
-        target = (t + 1) * mu - acc
-        d = ((z[remain] - target) ** 2).sum(1)
-        pos = int(d.argmin())
-        sel.append(int(remain[pos]))
-        acc += z[remain[pos]]
-        remain = np.delete(remain, pos)
-    return sel
-
-
 def build_baseline(x, y, ratio, method, num_classes, cfg, seed=42, verbose=True):
     """返回 reps [M,1024], rep_labels [M], info"""
     x = torch.as_tensor(x).float().cpu()
@@ -125,14 +108,7 @@ def build_baseline(x, y, ratio, method, num_classes, cfg, seed=42, verbose=True)
             "quotas": np.bincount(y, minlength=num_classes).tolist(),
             "distill_sec": 0.0}
 
-    if method == "mean":
-        reps, labels = [], []
-        for c in range(num_classes):
-            idx = np.where(y == c)[0]
-            for part in np.array_split(idx, quotas[c]):
-                reps.append(x[part].mean(0))
-                labels.append(c)
-    elif method == "random":
+    if method == "random":
         rng = np.random.RandomState(seed)
         reps, labels = [], []
         for c in range(num_classes):
@@ -153,24 +129,15 @@ def build_baseline(x, y, ratio, method, num_classes, cfg, seed=42, verbose=True)
             reps.append(torch.from_numpy(km.cluster_centers_).float())
             labels += [c] * quotas[c]
         reps = torch.cat(reps, 0)
-    elif method == "herding":
-        reps, labels = [], []
-        for c in range(num_classes):
-            idx = np.where(y == c)[0]
-            sel = herding_select(x[idx].numpy(), quotas[c])
-            reps.append(x[idx[sel]])
-            labels += [c] * quotas[c]
-        reps = torch.cat(reps, 0)
-    elif method in ("kmeans_moment", "random_moment"):
-        base = "kmeans" if method == "kmeans_moment" else "random"
+    elif method == "kmeans_moment":
         reps, rep_y, base_info = build_baseline(
-            x, y, ratio, base, num_classes, cfg, seed=seed, verbose=False)
+            x, y, ratio, "kmeans", num_classes, cfg, seed=seed, verbose=False)
         stats = class_stats(x, y, num_classes)
         reps, cinfo = moment_calibration(
             reps, rep_y, stats,
             eps=float(cfg.get("moment_eps", 1e-6)),
             max_scale=float(cfg.get("moment_max_scale", 3.0)))
-        info = {**base_info, "method": method, "base": base,
+        info = {**base_info, "method": method, "base": "kmeans",
                 "moment_calibration": cinfo,
                 "distill_sec": base_info["distill_sec"] + cinfo["elapsed_sec"]}
         if verbose:

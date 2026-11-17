@@ -13,7 +13,7 @@ def main():
     ap.add_argument("--config", default="cifar10.yaml")
     ap.add_argument("--ratio", type=float, default=10.0)
     ap.add_argument("--method", default="bdm")
-    ap.add_argument("--variant", default="mean_var")
+    ap.add_argument("--variant", default="random_feature")
     ap.add_argument("--modes", default="fp32,fp16,int8")
     ap.add_argument("--seeds", default="0,1,2")
     a = ap.parse_args()

@@ -44,15 +44,14 @@ class StreamingStatistics:
                 f"alignment v{alignment.version_from} → v{alignment.version_to}")
         a = alignment.scale.double()
         b = alignment.bias.double()
-        for c in range(self.num_classes):
-            if self.count[c] == 0:
-                continue
-            var = self.M2[c] / self.count[c]
-            new_mean = a * self.mean[c] + b
-            new_var = a.pow(2) * var
-            self.mean[c] = new_mean
-            self.M2[c] = new_var * self.count[c]
-            self.estimated[c] = True
+        seen = self.count > 0
+        if seen.any():
+            cnt = torch.from_numpy(self.count[seen]).double().unsqueeze(1)
+            mean = self.mean[seen]
+            var = self.M2[seen] / cnt
+            self.mean[seen] = a * mean + b
+            self.M2[seen] = (a.pow(2) * var) * cnt
+            self.estimated[seen] = True
         self.version = int(version)
 
     # ------------------------------------------------------------------
@@ -98,6 +97,19 @@ class StreamingStatistics:
             raise ValueError(f"类别 {c} 没有统计量")
         var = self.M2[c] / self.count[c]
         return int(self.count[c]), self.mean[c].float(), var.float()
+
+    def stack(self, device="cpu"):
+        """把全部类别堆叠为张量，供批量（向量化）优化使用。
+
+        返回 (has, count, mean, var)，shape 依次为 [C], [C], [C,D], [C,D]；
+        缺失类别的 mean/var 为 0，由 has 标记。
+        """
+        count = torch.from_numpy(self.count)
+        has = count > 0
+        mean = self.mean.to(device).float()
+        var = (self.M2 / count.clamp_min(1).double().unsqueeze(1)
+               ).to(device).float()
+        return has.to(device), count.to(device), mean, var
 
     def stats_dict(self):
         return {c: (self.mean[c].float(), (self.M2[c] / self.count[c]).float())

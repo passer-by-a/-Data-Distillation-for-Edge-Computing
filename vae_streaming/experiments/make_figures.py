@@ -15,15 +15,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 STYLE = {
-    "frozen_stream_dm": ("frozen VAE + DM", "tab:blue"),
-    "online_naive_dm": ("online VAE + naive DM", "tab:orange"),
-    "online_replay_dm": ("online VAE + replay (re-encode)", "tab:green"),
-    "online_replay_align_dm": ("online VAE + replay + align + DM", "tab:red"),
-    "online_kmeans": ("online K-means", "tab:purple"),
-    "online_herding": ("online Herding", "tab:brown"),
-    "online_moment": ("moment calibration", "tab:pink"),
-    "online_reservoir": ("online reservoir", "tab:gray"),
-    "full_method": ("full method (patch 10%)", "black"),
+    "online_kmeans": ("VAE + K-means", "tab:purple"),
+    "online_moment": ("VAE + Moment Matching", "tab:pink"),
+    "dm": ("VAE + Nonlinear DM", "tab:red"),
 }
 
 
@@ -159,11 +153,24 @@ def main():
     ap.add_argument("--figures", default="vae_streaming/figures")
     ap.add_argument("--scenario", default="iid")
     ap.add_argument("--dataset", default=None)
+    ap.add_argument("--rounds", type=int, default=5,
+                    help="只画该轮数的结果（长流实验用 392）")
+    ap.add_argument("--tag", default=None,
+                    help="只画方法名以该后缀结尾的结果，并去掉该后缀")
+    ap.add_argument("--out-suffix", default="", help="附加到图文件名")
     args = ap.parse_args()
     objs = load(os.path.join(ROOT, args.results))
+    objs = [o for o in objs
+            if o["summary"].get("num_rounds") == args.rounds]
     if args.dataset:
         objs = [o for o in objs if o["summary"].get("dataset") == args.dataset]
+    if args.tag:
+        objs = [o for o in objs
+                if o["summary"]["method"].endswith(args.tag)]
+        for o in objs:
+            o["summary"]["method"] = o["summary"]["method"][:-len(args.tag)]
     prefix = f"{args.dataset}_" if args.dataset else ""
+    prefix = f"{prefix}{args.out_suffix.lstrip('_')}_" if args.out_suffix else prefix
     fd = os.path.join(ROOT, args.figures)
     os.makedirs(fd, exist_ok=True)
     if not objs:

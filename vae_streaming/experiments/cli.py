@@ -14,6 +14,13 @@ def build_parser(default_scenario, default_methods):
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--budget", type=int, default=None)
     ap.add_argument("--initial-fraction", type=float, default=None)
+    ap.add_argument("--class-quota", type=int, default=None,
+                    help="IID 下每类每轮的固定样本数（base 自动吸收类别差异）")
+    ap.add_argument("--update-every", type=int, default=None,
+                    help="每累积多少轮做一次在线 VAE 更新（默认 1）")
+    ap.add_argument("--history-mode", default=None, choices=["full", "replay"],
+                    help="历史预算口径：full=累计全部历史；replay=固定预算 "
+                         "replay+current（消融对齐用）")
     ap.add_argument("--initial-epochs", type=int, default=None)
     ap.add_argument("--vae-steps", type=int, default=None)
     ap.add_argument("--cloud-steps", type=int, default=None)
@@ -39,6 +46,12 @@ def run_cli(default_scenario, default_methods):
         cfg["stream"]["num_rounds"] = args.rounds
     if args.initial_fraction is not None:
         cfg["stream"]["initial_fraction"] = args.initial_fraction
+    if args.class_quota is not None:
+        cfg["stream"]["class_quota"] = args.class_quota
+    if args.update_every is not None:
+        cfg["vae"]["update_every_rounds"] = args.update_every
+    if args.history_mode is not None:
+        cfg["stream"]["history_mode"] = args.history_mode
     if args.budget is not None:
         cfg["memory"]["representative_budget"] = args.budget
     if args.initial_epochs is not None:

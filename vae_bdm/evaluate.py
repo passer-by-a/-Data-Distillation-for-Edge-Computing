@@ -15,17 +15,8 @@ from .quant import payload_table, quantize_pair, save_payload
 
 
 VARIANTS = {
-    "mean": {"lambda_var": 0.0},
-    "mean_var": {"lambda_var": 1.0},
-    "var_low": {"lambda_var": 0.1},
-    "var_high": {"lambda_var": 10.0},
-    "mean_var_randinit": {"lambda_var": 1.0, "init": "random"},
-    "full": {"lambda_var": 1.0, "use_full_stats": True},
-    "anchor": {"lambda_var": 1.0, "lambda_anchor": 0.01},
-    "diversity": {"lambda_var": 1.0, "lambda_diversity": 0.01},
-    "cov": {"lambda_var": 1.0, "use_covariance": True},
-    "all": {"lambda_var": 1.0, "lambda_anchor": 0.01,
-            "lambda_diversity": 0.01, "use_covariance": True},
+    # 原版 DM：固定随机 MLP 特征空间中的逐类均值匹配
+    "random_feature": {},
     # 每类更新次数消融
     "upd30": {"updates_per_class": 30},
     "upd100": {"updates_per_class": 100},
@@ -109,14 +100,13 @@ def run_method(cfg, feats, method, ratio, variant=None, seeds=(0, 1, 2),
         info = {"method": "full", "ratio": 1.0, "n_reps": len(y),
                 "distill_sec": 0.0}
         tag = "full"
-    elif method in ("random", "mean", "kmeans", "herding",
-                    "kmeans_moment", "random_moment"):
+    elif method in ("random", "kmeans", "kmeans_moment"):
         reps, rep_y, info = build_baseline(
             x, y, ratio, method, cfg["num_classes"], cfg["baseline"],
             seed=cfg["baseline"]["seed"], verbose=verbose)
         tag = method
     elif method == "bdm":
-        variant = variant or "mean_var"
+        variant = variant or "random_feature"
         dcfg = copy.deepcopy(cfg["dm"])
         bv = cfg.get("bdm_validation", {})
         dcfg["val_head"] = bv.get("head", dcfg.get("val_head", "linear"))
@@ -146,10 +136,8 @@ def run_method(cfg, feats, method, ratio, variant=None, seeds=(0, 1, 2),
                 "total_optimizer_steps": out.get("total_optimizer_steps"),
                 "updates_per_class": out.get("updates_per_class"),
                 "per_class_optimizer": out.get("per_class_optimizer"),
-                "anchor_scope": out.get("anchor_scope"),
                 "val_head": out.get("val_head"), "val_epochs": out.get("val_epochs"),
-                "val_seed": out.get("val_seed"), "selection": out.get("selection"),
-                "cov_issues": out.get("cov_issues")}
+                "val_seed": out.get("val_seed"), "selection": out.get("selection")}
         tag = f"bdm_{variant}"
     else:
         raise ValueError(method)
@@ -203,8 +191,7 @@ def run_method(cfg, feats, method, ratio, variant=None, seeds=(0, 1, 2),
         rec["best_step"] = info.get("best_step")
         rec["peak_gpu_gb"] = info.get("peak_gpu_gb")
         for k in ("class_update_counts", "total_optimizer_steps",
-                  "updates_per_class", "per_class_optimizer", "anchor_scope",
-                  "cov_issues"):
+                  "updates_per_class", "per_class_optimizer"):
             if k in info:
                 rec[k] = info[k]
     if save_reps:
@@ -225,7 +212,7 @@ def run_method(cfg, feats, method, ratio, variant=None, seeds=(0, 1, 2),
 
 def eval_quantized(cfg, feats, method, ratio, variant=None, modes=("fp32", "fp16", "int8"),
                    seeds=(0, 1, 2), out_dir=None, tag=None):
-    p = reps_path(cfg, method if method != "bdm" else f"bdm_{variant or 'mean_var'}", ratio)
+    p = reps_path(cfg, method if method != "bdm" else f"bdm_{variant or 'random_feature'}", ratio)
     if not os.path.exists(p):
         raise FileNotFoundError(p)
     obj = np.load(p, allow_pickle=True)

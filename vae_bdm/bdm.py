@@ -1,9 +1,10 @@
 """Batch Distribution Matching (VAE-BDM, v2)
 
+原版 DM：固定随机 MLP 特征空间中的逐类均值匹配。
+
 固定协议：
   - 每类一个 nn.Parameter + 每类独立 AdamW；非当前类完全不更新
   - balanced 更新：每轮随机排列全部类别，每个类更新次数严格等于 updates_per_class
-  - anchor 只作用于当前类
   - 不使用 random_class / 单张量优化器 / 全局 anchor
 
 S 是可直接优化的张量参数；标签固定，VAE 冻结。
@@ -13,9 +14,9 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from sklearn.cluster import KMeans
 
+from random_feature import RandomMLP
 from .cloud import quick_val_acc
 
 
@@ -68,9 +69,13 @@ class BatchDM:
         self.val_seed = int(cfg.get("val_seed", 0))
         self.selection = cfg.get("selection", "val")  # val / final
         self.save_every = int(cfg.get("save_every", 0))
-        self.use_covariance = bool(cfg.get("use_covariance", False))
-        self.use_full_stats = bool(cfg.get("use_full_stats", False))
-        self.cov_dim = int(cfg.get("cov_dim", 64))
+        # 原版 DM：固定随机 MLP 特征空间中的均值匹配
+        self.feature_net = RandomMLP(
+            self.dim,
+            hidden_dim=int(cfg.get("feature_hidden", 2048)),
+            output_dim=int(cfg.get("feature_out", 1024)),
+            seed=int(cfg.get("feature_seed", 0))).to(self.device)
+        self.feat_cache = {}
 
         # ---------- 初始化代表特征 ----------
         reps, labels = [], []
@@ -106,32 +111,10 @@ class BatchDM:
                               weight_decay=float(cfg.get("weight_decay", 0.0)))
             for p in self.S_by_class]
 
-        # ---------- 完整类别统计量 ----------
-        self.full_mean, self.full_var = {}, {}
-        for c in range(num_classes):
-            z = self.x[self.cls_idx[c]].to(self.device).float()
-            self.full_mean[c] = z.mean(0)
-            self.full_var[c] = z.var(0, unbiased=False)
-
-        # ---------- 固定随机投影 + 完整协方差（可选） ----------
-        self.P = None
-        self.full_cov = {}
-        if self.use_covariance:
-            g = torch.Generator().manual_seed(seed)
-            P = torch.randn(self.dim, self.cov_dim, generator=g)
-            self.P = torch.linalg.qr(P).Q.to(self.device).float()
-            if self.use_full_stats:
-                for c in range(num_classes):
-                    z = self.x[self.cls_idx[c]].to(self.device).float()
-                    pr = z @ self.P
-                    pr = pr - pr.mean(0, keepdim=True)
-                    self.full_cov[c] = pr.t() @ pr / max(1, len(pr) - 1)
-
         # ---------- 审计状态 ----------
         self.logs = []
         self.class_update_counts = np.zeros(num_classes, dtype=np.int64)
         self.total_optimizer_steps = 0
-        self.cov_issues = {c: None for c in range(num_classes)}
         self._bal_order = None
         self._bal_pos = 0
 
@@ -145,66 +128,32 @@ class BatchDM:
     # ============================================================
     # 单类损失
     # ============================================================
+    def _class_feat(self, c):
+        """整类样本经固定随机网络后的特征，惰性缓存一次。
+
+        feature_net 无梯度且逐样本独立，因此对批次做前向与先整类前向再取子集等价，
+        可把每个 step 的 256 次前向降为每类一次。
+        """
+        if c not in self.feat_cache:
+            with torch.no_grad():
+                xc = self.x[self.cls_idx[c]].to(self.device).float()
+                self.feat_cache[c] = self.feature_net(xc)
+        return self.feat_cache[c]
+
     def _losses(self, c):
         idx = self.cls_idx[c]
         n = min(int(self.cfg.get("real_batch_size", 256)), len(idx))
-        sel = self.rng.choice(idx, n, replace=False)
-        zr = self.x[sel].to(self.device).float()
+        pos = self.rng.choice(len(idx), n, replace=False)
         zs = self.S_by_class[c]
 
-        if self.use_full_stats:
-            mu_r, var_r = self.full_mean[c], self.full_var[c]
-        else:
-            mu_r = zr.mean(0)
-            var_r = zr.var(0, unbiased=False)
-        mu_s = zs.mean(0)
-        var_s = zs.var(0, unbiased=False) if len(zs) > 1 else torch.zeros_like(mu_s)
-        l_mean = (mu_r - mu_s).pow(2).mean()
-        l_var = (var_r - var_s).pow(2).mean() if len(zs) > 1 else \
-            torch.zeros((), device=self.device)
+        # 原版 DM：固定随机特征空间中的均值匹配
+        real_feat = self._class_feat(c)[torch.as_tensor(
+            pos, device=self.device)]
+        l_mean = (real_feat.mean(0) - self.feature_net(zs).mean(0)
+                  ).pow(2).mean()
 
-        l_anchor = (zs - self.S0_by_class[c]).pow(2).mean()
-
-        l_div = torch.zeros((), device=self.device)
-        if self.cfg.get("lambda_diversity", 0.0) > 0 and len(zs) > 1:
-            zn = F.normalize(zs, dim=1)
-            sim = zn @ zn.t()
-            mask = ~torch.eye(len(zs), dtype=torch.bool, device=self.device)
-            l_div = sim[mask].pow(2).mean()
-
-        l_cov = torch.zeros((), device=self.device)
-        cov_info = None
-        if self.use_covariance:
-            if len(zs) < 2:
-                cov_info = {"source": "disabled", "n_reps": len(zs),
-                            "reason": "少于2个代表特征"}
-            else:
-                ps = zs @ self.P
-                ps = ps - ps.mean(0, keepdim=True)
-                cs = ps.t() @ ps / max(1, len(ps) - 1)
-                if self.use_full_stats and c in self.full_cov:
-                    target, source = self.full_cov[c], "full"
-                else:
-                    pr = zr @ self.P
-                    pr = pr - pr.mean(0, keepdim=True)
-                    target, source = pr.t() @ pr / max(1, len(pr) - 1), "batch"
-                l_cov = (target - cs).pow(2).mean()
-                cov_info = {"source": source, "n_reps": len(zs),
-                            "rank": int(min(len(zs) - 1, self.cov_dim)),
-                            "rank_deficient": bool(len(zs) - 1 < self.cov_dim),
-                            "projected_dim": self.cov_dim}
-            self.cov_issues[c] = cov_info
-
-        loss = (self.cfg.get("lambda_mean", 1.0) * l_mean
-                + self.cfg.get("lambda_var", 1.0) * l_var
-                + self.cfg.get("lambda_anchor", 0.0) * l_anchor
-                + self.cfg.get("lambda_diversity", 0.0) * l_div
-                + self.cfg.get("lambda_cov", 1.0) * l_cov)
-        stats = {"mean": l_mean.detach(), "var": l_var.detach(),
-                 "anchor": l_anchor.detach(), "div": l_div.detach(),
-                 "cov": l_cov.detach(),
-                 "var_ratio": (zs.detach().var(0, unbiased=False).mean()
-                               / self.full_var[c].mean().clamp_min(1e-8)),
+        loss = self.cfg.get("lambda_mean", 1.0) * l_mean
+        stats = {"mean": l_mean.detach(),
                  "syn_norm": zs.detach().norm(dim=1).mean()}
         return loss, stats
 
@@ -263,8 +212,7 @@ class BatchDM:
                     self.logs.append(rec)
                 if need_print:
                     print(f"  iter {step:>4} loss {rec['loss']:.5f} "
-                          f"mean {rec['mean']:.5f} var {rec['var']:.5f} "
-                          f"var_ratio {rec['var_ratio']:.3f}", flush=True)
+                          f"mean {rec['mean']:.5f}", flush=True)
 
         # balanced：每轮随机排列全部类别；断点续训时按已完成的每类次数继续
         while int(self.class_update_counts.min()) < self.updates_per_class:
@@ -302,11 +250,8 @@ class BatchDM:
                 "update_schedule": "balanced",
                 "updates_per_class": self.updates_per_class,
                 "per_class_optimizer": True,
-                "anchor_scope": "class",
                 "val_head": self.val_head, "val_epochs": self.val_epochs,
-                "val_seed": self.val_seed, "selection": self.selection,
-                "cov_issues": {str(k): v for k, v in self.cov_issues.items()
-                               if v is not None}}
+                "val_seed": self.val_seed, "selection": self.selection}
 
     def _record(self, step, loss, stats):
         rec = {"iter": int(step), "loss": float(loss.detach())}

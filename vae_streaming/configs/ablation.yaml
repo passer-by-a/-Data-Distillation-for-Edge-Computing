@@ -17,42 +17,12 @@ stream:
 # 消融矩阵（由 experiments/run_ablations.py 读取）
 # 每个条目覆盖 base 配置中的对应键
 ablations:
-  frozen_stream_dm:
-    vae: {online_update: false}
-    alignment: {method: diagonal_affine}
-    distillation: {method: dm}
-    communication: {mode: full_sync}
-  online_naive_dm:
-    vae: {online_update: true, replay_enabled: false, replay_ratio: 0.0}
-    alignment: {method: none}
-    distillation: {method: dm}
-    communication: {mode: full_sync}
-  online_replay_dm:
-    vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
-    alignment: {method: reencode}
-    distillation: {method: dm}
-    communication: {mode: full_sync}
-  online_replay_align_dm:
-    vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
-    alignment: {method: diagonal_affine}
-    distillation: {method: dm}
-    communication: {mode: full_sync}
-  online_replay_align_kmeans:
-    vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
-    alignment: {method: diagonal_affine}
-    distillation: {method: kmeans}
-    communication: {mode: full_sync}
-  online_replay_align_herding:
-    vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
-    alignment: {method: diagonal_affine}
-    distillation: {method: herding}
-    communication: {mode: full_sync}
-  full_method_patch:
+  dm_patch:
     vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
     alignment: {method: diagonal_affine}
     distillation: {method: dm}
     communication: {mode: patch, patch_fraction: 0.10}
-  full_method_patch_allopt:
+  dm_patch_allopt:
     vae: {online_update: true, replay_enabled: true, replay_ratio: 0.25}
     alignment: {method: diagonal_affine}
     distillation: {method: dm, patch_optimize: all}
@@ -97,7 +67,6 @@ distillation:
   lr: 0.01
   weight_decay: 0.0
   lambda_mean: 1.0
-  lambda_var: 1.0
   lambda_anchor: 0.01
   seed: 42
 

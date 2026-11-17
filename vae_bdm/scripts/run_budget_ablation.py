@@ -13,7 +13,7 @@ def main():
     ap.add_argument("--config", default="cifar10_v2.yaml")
     ap.add_argument("--ratios", default="50,100")
     ap.add_argument("--methods", default="kmeans,bdm")
-    ap.add_argument("--variant", default="mean_var")
+    ap.add_argument("--variant", default="random_feature")
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--seeds", default="0,1,2")

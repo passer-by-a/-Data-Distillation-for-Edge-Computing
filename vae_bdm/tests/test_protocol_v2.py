@@ -29,8 +29,7 @@ def _data(C=3, n=30, seed=0):
 
 def _cfg(**kw):
     cfg = dict(feature_dim=DIM, updates_per_class=2,
-               lr=0.01, weight_decay=0.0, lambda_mean=1.0, lambda_var=1.0,
-               lambda_anchor=0.0, lambda_diversity=0.0, use_covariance=False,
+               lr=0.01, weight_decay=0.0, lambda_mean=1.0,
                selection="final", kmeans_seed=0, kmeans_n_init=1,
                kmeans_max_iter=10, real_batch_size=16, log_every=10,
                eval_every=100)
@@ -69,12 +68,14 @@ def test_gradients_flow():
     assert torch.isfinite(loss).all()
 
 
-def test_anchor_scope_class():
+def test_random_feature_mean_match():
+    """原版 DM：损失等于固定随机特征空间中的逐类均值匹配。"""
     x, y = _data()
-    cfg = _cfg(lambda_mean=0.0, lambda_var=0.0, lambda_anchor=1.0)
-    dm = BatchDM(x, y, [3, 3, 3], 3, cfg, seed=42, device="cpu")
+    dm = BatchDM(x, y, [3, 3, 3], 3, _cfg(real_batch_size=30),
+                 seed=42, device="cpu")
     loss, _ = dm._losses(1)
-    manual = (dm.S_by_class[1] - dm.S0_by_class[1]).pow(2).mean()
+    manual = (dm._class_feat(1).mean(0)
+              - dm.feature_net(dm.S_by_class[1]).mean(0)).pow(2).mean()
     assert torch.allclose(loss, manual, atol=1e-6)
     dm.optimizers[1].zero_grad(set_to_none=True)
     loss.backward()

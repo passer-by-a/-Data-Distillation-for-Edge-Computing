@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 
-from vae_bdm.baselines import allocate_quotas, herding_select
+from vae_bdm.baselines import allocate_quotas
 
 
 def _select_class(z, q, method, seed, cfg):
@@ -24,9 +24,6 @@ def _select_class(z, q, method, seed, cfg):
         km = KMeans(n_clusters=q, random_state=seed, n_init=1, max_iter=100)
         km.fit(z.numpy())
         return torch.from_numpy(km.cluster_centers_).float()
-    if method == "herding":
-        sel = herding_select(z.numpy(), q)
-        return z[sel]
     raise ValueError(f"未知初始化方法: {method}")
 
 
@@ -48,10 +45,6 @@ def initialize_representatives(x, y, quotas, method="kmeans", seed=42,
         dcfg.setdefault("lr", 0.01)
         dcfg.setdefault("weight_decay", 0.0)
         dcfg.setdefault("lambda_mean", 1.0)
-        dcfg.setdefault("lambda_var", 1.0)
-        dcfg.setdefault("lambda_anchor", 0.0)
-        dcfg.setdefault("lambda_diversity", 0.0)
-        dcfg.setdefault("use_covariance", False)
         dcfg.setdefault("selection", "final")
         dcfg.setdefault("log_every", 1000)
         dcfg.setdefault("eval_every", 1000)

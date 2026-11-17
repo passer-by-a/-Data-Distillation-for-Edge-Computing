@@ -15,7 +15,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="vae_streaming/configs/cifar100.yaml")
     ap.add_argument("--scenarios", default="iid,label_shift,covariate_shift")
-    ap.add_argument("--methods", default="online_replay_align_dm")
+    ap.add_argument("--methods",
+                    default="online_kmeans,online_moment,dm")
     ap.add_argument("--seeds", default="42")
     ap.add_argument("--rounds", type=int, default=None)
     args = ap.parse_args()

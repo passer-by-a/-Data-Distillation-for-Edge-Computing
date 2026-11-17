@@ -77,8 +77,6 @@ def _summarize_cfg(cfg):
                "updates_per_class": cfg["dm"].get("updates_per_class"),
                "per_class_optimizer": (True if v2 else
                                        cfg["dm"].get("per_class_optimizer")),
-               "anchor_scope": ("class" if v2 else
-                                cfg["dm"].get("anchor_scope")),
                "real_batch_size": cfg["dm"].get("real_batch_size"),
                "lr": cfg["dm"].get("lr"),
                "log_every": cfg["dm"].get("log_every"),

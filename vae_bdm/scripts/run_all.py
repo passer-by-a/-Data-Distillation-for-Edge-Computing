@@ -16,7 +16,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="cifar10.yaml")
     ap.add_argument("--ratio", type=float, default=10.0)
-    ap.add_argument("--variants", default="mean,mean_var,full,anchor,diversity,cov,all")
+    ap.add_argument("--variants", default="random_feature")
     a = ap.parse_args()
     pkg = "vae_bdm.scripts"
     run([f"{pkg}.extract_features", "--config", a.config])

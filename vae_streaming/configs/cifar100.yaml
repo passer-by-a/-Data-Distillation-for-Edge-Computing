@@ -33,7 +33,7 @@ memory:
   replay_strategy: class_balanced   # class_balanced / uniform
   raw_replay_capacity: 1000
   representative_budget: 980
-  representative_init: kmeans       # random / kmeans / herding / bdm
+  representative_init: kmeans       # random / kmeans
 
 alignment:
   method: diagonal_affine           # none / reencode / diagonal_affine
@@ -41,13 +41,12 @@ alignment:
   max_scale: 3.0
 
 distillation:
-  method: dm                        # dm / kmeans / herding / reservoir / moment
+  method: dm                        # dm / kmeans / moment
   patch_optimize: synced_only       # synced_only / all
   updates_per_class: 20
   lr: 0.01
   weight_decay: 0.0
   lambda_mean: 1.0
-  lambda_var: 1.0
   lambda_anchor: 0.01
   seed: 42
 

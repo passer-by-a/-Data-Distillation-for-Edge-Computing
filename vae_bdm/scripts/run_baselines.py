@@ -1,4 +1,4 @@
-"""Step 2: Full/Random/Mean/K-means/Herding 基线"""
+"""Step 2: Full / Random / K-means / K-means + Moment 基线"""
 import argparse
 import csv
 import json
@@ -8,7 +8,7 @@ from vae_bdm.scripts._common import load_cfg
 from vae_bdm.features import load_features
 from vae_bdm.evaluate import run_method, save_json
 
-METHODS = ["full", "random", "mean", "kmeans", "herding"]
+METHODS = ["full", "random", "kmeans", "kmeans_moment"]
 
 
 def main():

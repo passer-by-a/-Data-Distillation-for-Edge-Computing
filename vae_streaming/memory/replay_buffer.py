@@ -1,6 +1,6 @@
 """边缘 Raw Replay Memory: 有界、类平衡 Reservoir Sampling
 
-只保存原始图像与标签；不上传，只用于 VAE 持续训练、特征重编码与锚点对齐。
+只保存原始图像、标签与所属轮次；不上传，只用于 VAE 持续训练、特征重编码与锚点对齐。
 回放样本不会被重新计入统计量（统计接口只接收当前轮特征）。
 """
 import numpy as np
@@ -31,10 +31,15 @@ class ClassBalancedReservoir:
     def _bucket(self, c):
         return c if self.class_balanced else 0
 
-    def add_batch(self, images, labels):
-        """images: uint8 [n,3,32,32]（CPU）；labels: long [n]"""
+    def add_batch(self, images, labels, round_idx=-1):
+        """images: uint8 [n,3,32,32]（CPU）；labels: long [n]
+
+        同时记录样本所属轮次，供 `get(exclude_rounds=...)` 排除仍留在
+        VAE pending 中的轮次，避免同一批样本重复进入同一个训练 batch。
+        """
         images = images.cpu()
         labels = labels.cpu()
+        round_idx = int(round_idx)
         for i in range(len(labels)):
             c = int(labels[i])
             if c < 0 or c >= self.num_classes:
@@ -47,18 +52,22 @@ class ClassBalancedReservoir:
             self.total_added += 1
             buf = self.buffers[b]
             if len(buf) < cap:
-                buf.append((images[i].clone(), c))
+                buf.append((images[i].clone(), c, round_idx))
             else:
                 j = int(self.rng.randint(0, int(self.seen[b])))
                 if j < cap:
-                    buf[j] = (images[i].clone(), c)
+                    buf[j] = (images[i].clone(), c, round_idx)
                     self.total_replaced += 1
 
     # ------------------------------------------------------------------
-    def get(self):
+    def get(self, exclude_rounds=None):
+        """返回 (images, labels)；exclude_rounds 中的轮次不计入。"""
+        excl = set(int(r) for r in exclude_rounds) if exclude_rounds else set()
         imgs, ys = [], []
         for buf in self.buffers:
-            for img, y in buf:
+            for img, y, r in buf:
+                if r in excl:
+                    continue
                 imgs.append(img)
                 ys.append(y)
         if not imgs:
@@ -103,5 +112,9 @@ class ClassBalancedReservoir:
         obj.rng.set_state(st["rng_state"])
         obj.total_added = int(st["total_added"])
         obj.total_replaced = int(st["total_replaced"])
-        obj.buffers = [list(b) for b in st["per_class"]]
+        obj.buffers = []
+        for b in st["per_class"]:
+            # 兼容旧断点：早期条目只有 (image, label)，缺少轮次记为 -1
+            obj.buffers.append([
+                (e[0], int(e[1]), int(e[2]) if len(e) > 2 else -1) for e in b])
         return obj

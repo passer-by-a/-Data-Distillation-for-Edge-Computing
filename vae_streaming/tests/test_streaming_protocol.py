@@ -464,7 +464,7 @@ def test_full_pipeline_resume(tmp_path):
     # 用确定性的 random 初始化，隔离 sklearn KMeans 的线程级浮点差异
     cfg["memory"]["representative_init"] = "random"
 
-    kw = dict(method="online_replay_align_dm", seed=7, verbose=False, save=True)
+    kw = dict(method="dm", seed=7, verbose=False, save=True)
     full = run_method(cfg, **kw)
     partial = run_method(cfg, stop_after=0, **kw)
     assert len(partial["rounds"]) == 2
@@ -513,23 +513,29 @@ def test_alignment_normalized_space():
 # ======================================================================
 def test_base_cache_signature_changes():
     from vae_streaming.config_utils import load_config
-    from vae_streaming.experiments.engine import _base_signature
+    from vae_streaming.experiments.engine import _base_signature, _build_stream
 
     cfg = load_config("vae_streaming/configs/cifar10.yaml")
-    s0 = _base_signature(cfg, 42)
+    stream = _build_stream(cfg)
+    s0 = _base_signature(cfg, 42, stream)
+    assert s0["n_base"] == len(stream.base_indices)
+    assert "base_indices_sha1" in s0
+    # 影响 base 划分的参数必须重建 stream 才能反映到签名
     for key, val in (("shuffle_seed", 99), ("initial_fraction", 0.3)):
         c = copy.deepcopy(cfg)
         c["stream"][key] = val
-        assert _base_signature(c, 42) != s0, key
+        assert _base_signature(c, 42, _build_stream(c)) != s0, key
     c = copy.deepcopy(cfg)
     c["split_seed"] = 7
-    assert _base_signature(c, 42) != s0
-    c = copy.deepcopy(cfg)
-    c["vae"]["batch_size"] = 64
-    assert _base_signature(c, 42) != s0
+    assert _base_signature(c, 42, _build_stream(c)) != s0
+    for path, val in ((("vae", "batch_size"), 64),
+                      (("vae", "beta"), 0.5)):
+        c = copy.deepcopy(cfg)
+        c[path[0]][path[1]] = val
+        assert _base_signature(c, 42, stream) != s0, path
     c = copy.deepcopy(cfg)
     c["base_channels"] = 32
-    assert _base_signature(c, 42) != s0
+    assert _base_signature(c, 42, stream) != s0
 
 
 # ======================================================================
@@ -551,18 +557,23 @@ def test_resume_signature_covers_config():
 
 
 # ======================================================================
-# 24. reencode 方法必须真正调用 StreamingDM
+# 24. DM 目标集合：更新轮/非更新轮统一（replay + current）
 # ======================================================================
-def test_reencode_runs_streaming_dm(tmp_path):
-    from vae_streaming.config_utils import load_config
+def test_dm_target_scope_unified(tmp_path):
     from vae_streaming.experiments.engine import run_method
 
     cfg = _tiny_engine_cfg(tmp_path)
-    res = run_method(cfg, "online_replay_dm", seed=7, verbose=False)
-    rec = res["rounds"][1]
-    assert rec["distill"]["method"] == "streaming_dm"
-    assert rec["distill"].get("init") == "reencode_kmeans"
-    assert rec["stats_scope"] == "replay_plus_current"
+    cfg["stream"]["num_rounds"] = 2
+    res = run_method(cfg, "dm", seed=7, verbose=False)
+    rec0, rec1 = res["rounds"][1], res["rounds"][2]
+    assert rec0["distill"]["method"] == "streaming_dm"
+    # 首轮 replay 已含 base 样本，因此从第 0 轮起目标就是 replay + current
+    assert rec0["distill"]["target_scope"] == "replay_plus_current"
+    assert rec1["distill"]["target_scope"] == "replay_plus_current"
+    assert rec0["distill"]["n_target"] > rec0["n_current"]
+    assert rec1["distill"]["n_target"] > rec1["n_current"]
+    # 代表集跨版本继承，统计历史未被重置
+    assert rec1["stats_scope"] == "aligned_full_history"
 
 
 def _tiny_engine_cfg(tmp_path):
@@ -582,30 +593,23 @@ def _tiny_engine_cfg(tmp_path):
 
 
 # ======================================================================
-# 25. Replay-Reinit 基线：只重编码 + 重新初始化，不跑 DM
-# ======================================================================
-def test_replay_reinit_baseline(tmp_path):
-    from vae_streaming.experiments.engine import run_method
-
-    cfg = _tiny_engine_cfg(tmp_path / "reinit")
-    res = run_method(cfg, "replay_reinit", seed=7, verbose=False)
-    rec = res["rounds"][1]
-    assert rec["distill"]["method"] == "reinit"
-    assert rec["stats_scope"] == "replay_plus_current"
-    assert rec["n_cumulative_seen"] > rec["n_effective_stats"]
-    assert rec["n_replay"] <= cfg["memory"]["raw_replay_capacity"]
-
-
-# ======================================================================
-# 26. 更新预算与上传预算分离
+# 25. 更新预算与上传预算分离
 # ======================================================================
 def test_update_upload_budget_separation(tmp_path):
     from vae_streaming.experiments.engine import run_method
 
+    def _cfg(p, update_fraction, sync_mode, patch_fraction):
+        cfg = _tiny_engine_cfg(p)
+        cfg["alignment"]["method"] = "diagonal_affine"
+        cfg["distillation"]["method"] = "dm"
+        cfg["distillation"]["update_fraction"] = update_fraction
+        cfg["communication"]["mode"] = sync_mode
+        cfg["communication"]["patch_fraction"] = patch_fraction
+        return cfg
+
     # 10% 更新 + 100% 上传
-    cfg = _tiny_engine_cfg(tmp_path / "u10t100")
-    rec = run_method(cfg, "affine_dm_partial_10up_100tx", seed=7,
-                     verbose=False)["rounds"][1]
+    cfg = _cfg(tmp_path / "u10t100", 0.10, "full_sync", 0.10)
+    rec = run_method(cfg, None, seed=7, verbose=False)["rounds"][1]
     assert rec["sync"]["update_fraction"] == pytest.approx(0.10)
     assert rec["sync"]["n_updated"] < rec["sync"]["n_uploaded"]
     assert rec["sync"]["n_uploaded"] == cfg["memory"]["representative_budget"]
@@ -613,10 +617,30 @@ def test_update_upload_budget_separation(tmp_path):
     assert rec["distill"]["n_optimized"] < cfg["memory"]["representative_budget"]
 
     # 100% 更新 + 10% 上传
-    cfg2 = _tiny_engine_cfg(tmp_path / "u100t10")
-    rec2 = run_method(cfg2, "affine_dm_patch_100up_10tx", seed=7,
-                      verbose=False)["rounds"][1]
+    cfg2 = _cfg(tmp_path / "u100t10", 1.0, "patch", 0.10)
+    rec2 = run_method(cfg2, None, seed=7, verbose=False)["rounds"][1]
     assert rec2["sync"]["update_fraction"] == pytest.approx(1.0)
     assert rec2["sync"]["n_updated"] == cfg2["memory"]["representative_budget"]
     assert rec2["sync"]["n_uploaded"] < cfg2["memory"]["representative_budget"]
     assert rec2["sync"]["local_unsynced"]["max"] > 0
+
+
+# ======================================================================
+# 27. 原版 DM：固定随机特征空间均值匹配
+# ======================================================================
+def test_random_feature_dm_objective():
+    from vae_streaming.distillation.streaming_dm import StreamingDM
+
+    torch.manual_seed(0)
+    feats = torch.randn(8, 16)
+    labels = torch.tensor([0] * 4 + [1] * 4)
+    cfg = {"updates_per_class": 2, "lr": 0.01,
+           "feature_hidden": 32, "feature_out": 16}
+    dm = StreamingDM(feats, labels, [4, 4], cfg, seed=0, device="cpu")
+    out = dm.update(
+        real_features=torch.randn(20, 16),
+        real_labels=torch.tensor([0] * 10 + [1] * 10))
+    assert out["info"]["objective"] == "random_feature_mean"
+    assert torch.isfinite(out["features"]).all()
+    assert not torch.allclose(out["features"], feats)
+    assert all(not p.requires_grad for p in dm.feature_net.parameters())

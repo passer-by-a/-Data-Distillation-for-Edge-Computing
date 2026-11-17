@@ -1,12 +1,12 @@
-"""非因果离线参考: 全量 49k 特征上的 Batch DM / K-means / Herding
+"""非因果离线参考: 全量 49k 特征上的 Batch DM / K-means / Random
 
 该脚本显式违反 Streaming 因果约束，只用于估计在线处理造成的性能差距，
 不可与在线方法当作同等数据可访问条件比较。
 
 python -m vae_streaming.experiments.run_offline_reference \
     --config vae_streaming/configs/cifar100.yaml \
-    --vae-ckpt vae_streaming/checkpoints/cifar100/iid/seed42/full_method/vae_v5.pt \
-    --protocol-from vae_streaming/results/cifar100/iid/full_method_seed42.json \
+    --vae-ckpt vae_streaming/checkpoints/cifar100/iid/seed42/dm/vae_v5.pt \
+    --protocol-from vae_streaming/results/cifar100/iid/dm_seed42.json \
     --method bdm
 """
 import argparse
@@ -40,8 +40,8 @@ def main():
     ap.add_argument("--vae-ckpt", required=True)
     ap.add_argument("--protocol-from", default=None,
                     help="共享归一化协议的 JSON；缺省则在全量训练集上重估（非因果）")
-    ap.add_argument("--method", default="bdm",
-                    choices=["random", "kmeans", "herding", "bdm"])
+    ap.add_argument("--method", default="kmeans",
+                    choices=["random", "kmeans", "bdm"])
     ap.add_argument("--seeds", default="0,1,2")
     ap.add_argument("--tag", default=None)
     args = ap.parse_args()

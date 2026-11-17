@@ -21,17 +21,11 @@ baseline:
 
 dm:
   init: kmeans
-  iterations: 3000
+  updates_per_class: 30
   real_batch_size: 256
   lr: 0.01
   weight_decay: 0.0
-  lambda_mean: 1.0
-  lambda_var: 1.0
-  lambda_anchor: 0.0
-  lambda_diversity: 0.0
-  use_covariance: false
-  cov_dim: 64
-  lambda_cov: 1.0
+  lambda_mean: 1.0       # 原版 DM：固定随机 MLP 特征空间中的均值匹配
   eval_every: 500
   val_epochs: 50
   seed: 42

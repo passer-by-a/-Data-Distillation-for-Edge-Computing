@@ -10,4 +10,4 @@ from vae_streaming.experiments.cli import run_cli  # noqa: E402
 
 
 if __name__ == "__main__":
-    run_cli("label_shift", ["online_replay_align_dm"])
+    run_cli("label_shift", ["online_kmeans", "online_moment", "dm"])

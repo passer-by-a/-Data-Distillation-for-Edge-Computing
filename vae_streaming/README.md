@@ -36,6 +36,52 @@ stream:
 - Covariate Shift：亮度 / 对比度 / 高斯模糊 / 颜色风格按轮次增强；测试域用同一确定性变换，
   但测试图像不参与任何更新。
 
+### 2.0 长流小批量协议
+
+小批量、多轮次时按下面两个参数构造，避免“每轮 100 张却更新 150 步”的失配：
+
+- `stream.class_quota`：每类每轮固定张数。Base 自动吸收类别总数差异
+  （CIFAR-10 各类 967–995 张，合计 9,800 = 20%），之后每轮严格 100 张。
+  392 轮 × 10 张/类正好耗尽每类剩余 3,920 张。
+- `vae.update_every_rounds`：累积若干轮后再做一次在线 VAE 更新。
+  取 10 时，每 10 轮累积约 1,000 张，更新仍为 150 步；
+  其余轮次只做编码、统计、代表集与云端同步，Encoder 版本保持不变。
+  **末轮强制 flush**：392 轮不能被 10 整除，最后一轮用余数样本（约 200 张）
+  补一次小 batch 更新，逐轮记录 `vae.final_flush=True`，保证全部样本都进入 VAE 梯度。
+  **Replay 与 Pending 互斥**：Replay 条目带轮次标签，更新时用
+  `replay.get(exclude_rounds=pending_rounds)` 排除仍在 pending 中的轮次，
+  避免同一批样本同时作为“当前数据”和“replay”进入同一个 batch。
+  优化子集与上传子集分别按 `update_fraction` / `patch_fraction` 独立抽样。
+
+**锚点抽样**：`_stratified_anchor_indices` 按类别容量做 water-filling，
+某类样本不足时把剩余名额重新分配给仍有余量的类别，实际锚点数不再少于
+`alignment.anchor_count`（除非 Replay 总量本身不足）。
+
+**时间与产物口径**：`edge_train_sec` 只含 VAE 训练（初始 + 在线），
+`edge_total_sec` 为边缘侧计算（训练 / 编码 / 对齐 / 统计 / 蒸馏 / 同步），
+`eval_total_sec`、`cloud_total_sec`、`wall_total_sec` 各自独立统计。
+部分运行（`--stop-after` 或中断）保存 `vae_partial.pt`，完整运行才是 `vae_final.pt`。
+
+**三种方法的历史预算口径**（`stream.history_mode`）：
+
+- `full`（默认）：按各方法自身机制保留历史 —— K-means 用固定预算的流式质心，
+  Moment 用 Chan 累计统计（base + 全部历史轮），DM 用固定 1,000 的 Replay + 当前轮。
+- `replay`：统一为“固定 1,000 Replay + 当前轮”重建统计，用于把 Moment 的
+  历史信息量对齐到 DM / K-means 的固定预算，作为方法对比的消融口径。
+  该开关只改变统计来源；K-means 的 coreset 与 DM 的目标集合本来就是固定预算，
+  因此它们的数值不变。
+
+**DM 口径统一**：`dm`（原 `replay_dm_randfeat`，其他 DM 变体删除后简化）采用与另两种方法相同的
+`alignment=diagonal_affine`（代表集跨版本继承，不再每轮 K-means 重建），
+并设置 `distillation.exact_target=True`：每一轮都用当前 Encoder 精确重编码
+Replay + 当前轮作为 DM 目标，更新轮与非更新轮的目标集合构造方式完全一致。
+逐轮记录 `distill.target_scope`（`replay_plus_current`）与 `distill.n_target`。
+
+**随机性隔离**：在线更新（含 torchvision 增强）在 `torch.random.fork_rng`
+的独立随机流中完成，按 `seed + 1e6 + 7919·round` 独立播种；全局 RNG 不被推进。
+因此三种方法从 Initial Base VAE 出发得到逐位相同的 Encoder 轨迹，
+逐轮用 `vae.encoder_sha1` 可复核。
+
 **VAE 预训练泄漏**：主实验的初始 VAE 只使用 Initial Base Set 训练（30 epoch），
 不使用第一阶段 49k 预训练权重。第一阶段权重只作为非因果离线参考。
 
@@ -91,17 +137,18 @@ M2 = M2_a + M2_b + δ²·n_a·n_b/n
 - 统计量转换：`μ ← a⊙μ+b`，`v ← a²⊙v`（近似，明确标记 estimated）。
 - 对齐不可靠时，正确性回退是整集完整同步；成本计入累计通信。
 
-### 3.4 Streaming DM
+### 3.4 Streaming DM（原版 DM：固定随机特征空间均值匹配）
 
 ```
-L_SDM = λ_m·||μ_S − μ_target||² + λ_v·||v_S − v_target||²
-        + λ_a·||S − S_aligned_prev||²
+f = RandomMLP(1024 → 2048 → 1024)   # 固定随机初始化，参数冻结
+L_SDM = ||mean(f(real_z)) − mean(f(syn_z))||² + λ_a·||S − S_aligned_prev||²
 ```
 
-- 目标统计量来自**当前版本**的统计记忆（已含本轮新样本）。
+- 与第一阶段 `BatchDM` 使用同一个目标，只是真实特征来自**当前版本**的统计/回放数据。
 - 逐类独立 `nn.Parameter` + 独立 AdamW；每类固定 `updates_per_class=20`。
 - 全量同步模式优化全部代表；固定预算 patch 模式只优化本轮允许更新的位置，
   其余位置严格保持对齐后的旧值。
+- 不包含方差/协方差/diversity 项；`λ_a` 只是稳定性锚点。
 
 ### 3.5 通信
 
@@ -118,19 +165,37 @@ L_SDM = λ_m·||μ_S − μ_target||² + λ_v·||v_S − v_target||²
 ## 4. 运行
 
 ```bash
-# 单元测试（22 项，含完整流水线断点续跑）
+# 单元测试（41 项，含完整流水线断点续跑与协议审计回归）
 python -m pytest vae_streaming/tests/test_streaming_protocol.py -q
 
 # CIFAR-100 IID 主实验（单方法）
 python -m vae_streaming.experiments.run_iid \
   --config vae_streaming/configs/cifar100.yaml \
-  --methods online_replay_align_dm --seeds 42
+  --methods dm --seeds 42
 
 # 全方法对照（IID）
 python -m vae_streaming.experiments.run_iid \
   --config vae_streaming/configs/cifar100.yaml \
-  --methods frozen_stream_dm,online_naive_dm,online_replay_dm,online_replay_align_dm,online_kmeans,online_herding,online_moment,online_reservoir,full_method \
+  --methods online_kmeans,online_moment,dm \
   --seeds 42,43,44
+
+# 长流小批量：392 轮，每类每轮 10 张，每累积 10 轮做一次在线更新
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10.yaml \
+  --methods online_kmeans,online_moment,dm \
+  --seeds 42 --rounds 392 --class-quota 10 --update-every 10 --tag r392p2
+
+# 历史预算对齐消融（Moment 改为 replay+current 固定预算）
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10.yaml \
+  --methods online_moment --seeds 42 --rounds 392 \
+  --class-quota 10 --update-every 10 --history-mode replay --tag r392p2rep
+
+# 长流报表与图（按轮数/标签过滤，避免混进 5 轮主表）
+python -m vae_streaming.experiments.make_report --dataset cifar10 \
+  --rounds 392 --tag _r392p2 --out vae_streaming/results/cifar10/main_table_r392p2.md
+python -m vae_streaming.experiments.make_figures --dataset cifar10 \
+  --rounds 392 --tag _r392p2 --out-suffix r392p2
 
 # 分布变化场景
 python -m vae_streaming.experiments.run_label_shift \
@@ -172,124 +237,66 @@ python -m vae_streaming.experiments.make_figures
 
 | 方法 | 最终 | 在线平均 | 最终 F1 | 累计通信 | 组/单图方差比 |
 |---|---|---|---|---|---|
-| online VAE + replay + DM（重编码） | **43.19±0.46** | **41.40±0.37** | 43.06 | 5.96 MB | 0.65 |
-| moment calibration | 39.46±0.52 | 38.12±0.42 | 38.33 | 5.96 MB | 1.00 |
-| frozen VAE + DM | 39.05±0.78 | 38.48±0.51 | 38.39 | 5.96 MB | 1.00 |
-| replay + 对齐 + Streaming DM | 39.02±0.41 | 37.10±0.25 | 37.94 | 5.96 MB | 1.00 |
-| online naive DM | 38.45±2.61 | 36.10±0.85 | 37.69 | 5.96 MB | 0.98 |
-| online Herding | 37.23±0.89 | 37.00±0.68 | 36.54 | 5.96 MB | 0.74 |
-| online K-means | 36.84±0.84 | 35.98±0.53 | 36.46 | 5.96 MB | 0.29 |
-| full method（patch 10%） | 35.67±0.62 | 34.28±0.59 | 35.43 | **1.54 MB** | 0.18 |
-| online Reservoir | 35.14±0.63 | 34.50±0.80 | 34.17 | 5.96 MB | 0.99 |
+| VAE + Nonlinear DM（Replay） | **41.68±0.57** | **40.24±0.44** | 41.82±0.57 | 5.96 MB | 0.48 |
+| VAE + Moment Matching | 39.46±0.52 | 38.12±0.42 | 38.33 | 5.96 MB | 1.00 |
+| VAE + K-means | 36.84±0.84 | 35.98±0.53 | 36.46 | 5.96 MB | 0.29 |
 
 观察：
 
-1. **Replay 重编码 + Streaming DM 是明确赢家**：最终比冻结 VAE 高 **+4.1**，在线平均高 **+2.9**，
-   且已接近同编码器空间的非因果离线 Batch DM（43.08）。
-2. **对角仿射对齐仍无收益**：held-out 相对误差 0.160±0.008；最终 39.02 ≈ 冻结 39.05。
-   5 轮内历史统计记忆抵不过对齐误差。
-3. **固定补丁 10% 通信降 74%，但掉 3.4 点**，组/单图方差比 0.18。
-4. **简单 coreset 全面落后**；moment calibration 是低成本强基线。
-5. INT8 测试精度相对 FP32 损失 ≤0.1 点。
+1. **Replay + 原版 DM 最强**：3 seeds 最终 41.68±0.57，比 K-means 高 4.8 点，
+   比 Moment Matching 高 2.2 点。
+2. Moment Matching 的方差比保持 1.00；K-means 明显收缩类内方差（0.29），
+   DM 居中（0.48）。
+3. 原版 DM 的精确性来自 Replay 重编码 + 初始化 + DM 三件事；只做重编码与
+   K-means 初始化而不跑 DM 的对照方法已删除，其历史数字不再引用。
 
 ### 5.1b CIFAR-10，IID，5 轮，预算 980（50:1），3 seeds
 
 CIFAR-10 的 20% Base 已能训练出较强编码器，初始精度 **76.08±0.58**，
-方法间差异缩小到约 2 点，呈现明显的**天花板效应**。
+方法间差距约 2 点，呈现明显的**天花板效应**。
 
 | 方法 | 最终 | 在线平均 | 累计通信 | 方差比 |
 |---|---|---|---|---|
-| online VAE + replay + DM（重编码） | **78.84±0.66** | **77.77±0.28** | 5.96 MB | 0.88 |
-| online Herding | 77.45±0.45 | 76.88±0.31 | 5.96 MB | 0.90 |
-| online Reservoir | 76.81±0.46 | 76.04±0.22 | 5.96 MB | 1.08 |
-| online moment | 76.74±0.56 | 75.16±0.41 | 5.96 MB | 1.00 |
-| replay + align + DM | 76.69±0.81 | 74.90±0.51 | 5.96 MB | 1.00 |
-| online naive DM | 76.44±0.72 | 73.56±0.91 | 5.96 MB | 1.01 |
-| frozen VAE + DM | 76.33±0.25 | 76.39±0.23 | 5.96 MB | 1.00 |
-| full method（patch 10%） | 76.40±0.99 | 74.20±0.50 | **1.54 MB** | 0.48 |
-| online K-means | 76.23±1.46 | 74.44±0.42 | 5.96 MB | 0.40 |
+| VAE + Nonlinear DM（Replay） | **78.12±0.50** | **77.26±0.16** | 5.96 MB | 0.69 |
+| VAE + Moment Matching | 76.74±0.56 | 75.16±0.41 | 5.96 MB | 1.00 |
+| VAE + K-means | 76.23±1.46 | 74.44±0.42 | 5.96 MB | 0.40 |
 
 观察：
 
-1. **CIFAR-10 上方法差距小**：最佳比冻结高约 2.5 点；20% Base 已接近够用。
-2. 重编码 replay + DM 与 Online Herding 最好；对齐 + DM 仍无收益（与 C100 一致）。
-3. **patch 10% 在 CIFAR-10 上精度基本不变**（76.40 vs 冻结 76.33），
-   同时通信降 74%——固定预算同步的代价高度依赖数据集难度；
-   在 C100 上同样的 10% 会掉 3.4 点。
-4. 在线早期 naive DM 的在线平均明显下降（73.56），最终才追回，说明无 replay/对齐时
-   编码器更新会短期破坏特征空间。
+1. **CIFAR-10 上 DM 仍领先**：最终 78.12，比 Moment 高 1.4 点、比 K-means 高 1.9 点，
+   但绝对差距小于 CIFAR-100。
+2. K-means 在 C10 上同样收缩方差（0.40），精度也最低。
 
-### 5.2 Label Shift（2 seeds）
+### 5.2 Label Shift / Covariate Shift（M3 已跑）
 
-| 方法 | 最终 | 当前强调类 | 历史类 |
+分布变化场景目前只有 Replay + 原版 DM 的结果（其余两方法待跑）：
+
+| 数据集 | 场景 | 最终 | 当前类/当前域 | 历史类/原域 |
+|---|---|---|---|---|
+| CIFAR-100 | Label Shift | 41.41±0.09 | 49.43±0.33 | 39.40±0.05 |
+| CIFAR-100 | Covariate Shift | 34.12±0.43 | 33.89±0.90 | — |
+| CIFAR-10 | Label Shift | 78.51±0.42 | 74.17±1.57 | 79.59±0.30 |
+| CIFAR-10 | Covariate Shift | 74.22±0.63 | 69.79±0.48 | — |
+
+### 5.4 Replay + 原版 DM 明细（CIFAR-100 IID，3 seeds，预算 980）
+
+| 方法 | 最终 | 在线平均 | 累计通信 |
 |---|---|---|---|
-| online VAE + replay + DM | **42.63±0.11** | 52.72±0.85 | **40.10±0.36** |
-| frozen VAE + DM | 39.24±0.60 | 44.30±1.20 | 37.97±0.45 |
-| replay + align + DM | 38.81±0.23 | 46.20±0.37 | 36.97±0.19 |
-| full method（patch 10%） | 35.13±0.14 | 41.85±0.35 | 33.45±0.08 |
+| Replay + 原版 DM（重编码 + 初始化 + DM） | **41.68±0.57** | **40.24±0.44** | 5.96 MB |
 
-历史类精度没有崩溃；重编码 replay + DM 在历史类与当前类上都最好。
-
-### 5.3 Covariate Shift（2 seeds）
-
-| 方法 | 原域 | 当前域（shift 强度 1.0） |
-|---|---|---|
-| frozen VAE + DM | **37.35±0.52** | 19.97±0.23 |
-| online VAE + replay + DM | 35.42±0.08 | **35.39±0.74** |
-| replay + align + DM | 33.11±0.86 | 30.96±1.33 |
-| full method（patch 10%） | 30.02±0.83 | 27.65±0.56 |
-
-**明确的稳定性—可塑性权衡**：冻结 VAE 在原域最好，但在漂移域跌到近随机；
-持续更新 VAE 的方法在原域只掉约 2 点，却在当前域保持 30–35 点。
-重编码 replay + DM 几乎消除了域差（35.42 vs 35.39）。
-这是本阶段最清晰的正向结论。
-
-### 5.4 消融（单种子 42）
-
-| 设置 | 最终 | 在线平均 | 累计通信 |
-|---|---|---|---|
-| patch 5%（Q≈49） | 35.19 | 34.60 | 1.29 MB |
-| patch 10%（Q≈98） | 35.67 | 34.28 | 1.54 MB |
-| patch 20%（Q≈196） | 37.13 | 35.41 | 2.03 MB |
-| 全同步，预算 980 | 39.02 | 37.10 | 5.96 MB |
-| 全同步，预算 2450 | 40.85 | 39.44 | 14.9 MB |
-| 全同步，预算 4900 | 42.04 | 40.49 | 29.8 MB |
-| patch 10%，预算 2450 | 36.89 | 35.80 | 3.77 MB |
-| patch 10%，预算 4900 | 38.29 | 36.79 | 7.50 MB |
-| 云端每轮 scratch（预算 980） | **40.78** | 38.42 | 5.96 MB |
-| 云端增量（预算 980） | 39.02 | 37.10 | 5.96 MB |
-| 无 stability 项 | 38.88 | 37.34 | 5.96 MB |
-| stability λ_s=0.1 | **40.16** | **38.48** | 5.96 MB |
-| patch 10%，优化全部代表（`all`） | 37.21 | 35.48 | 1.54 MB |
-
-观察：
-
-1. **patch 比例单调影响精度**：10% 相对 5% 只 +0.48，20% 再 +1.46；5 轮内补丁预算过小。
-2. **代表预算比同步方式更关键**：980→4900 全同步 +3.0；patch 980→4900 +2.6。
-3. **P0-3 变量分离**：同样 1.54 MB，`patch_optimize=all` 为 37.21，比默认
-   `synced_only` 的 35.67 高 **+1.54**。说明补丁模式下大部分精度损失来自
-   “只优化 Q 个位置”，而不是通信压缩本身。但 `all` 会让边缘本地代表领先云端
-   （`local_unsynced` max≈1.01），属于显式不一致，不能当作可部署协议。
-4. **云端每轮 scratch 反而比增量高 1.76 点**。每轮 200 步对 980 条代表已足够从头拟合，
-   持续保留的模型/优化器状态在 5 轮早期没有收益。
-5. **稳定性项有效**：最终 +1.28 / 在线 +1.14；对齐误差也明显下降。
-6. patch 模式方差比仍偏低（0.18–0.48），只更新固定位置会牺牲类内多样性。
+Replay 重编码提供当前版本的训练特征，DM 在此之上做逐类均值匹配。
+跨版本对齐后旧特征上的 DM 对照（`Affine + DM`）已随方法删除，不再引用。
 
 ### 5.5 非因果离线参考
 
 | 参考 | 方法 | 编码器 | 归一化 | 最终 |
 |---|---|---|---|---|
-| stage1_bdm | BDM | 第一阶段 49k 全量 VAE | 全量训练集重估 | **59.24** |
 | stage1_kmeans | K-means | 第一阶段 49k 全量 VAE | 全量训练集重估 | 58.31 |
-| stage1_herding | Herding | 第一阶段 49k 全量 VAE | 全量训练集重估 | 55.39 |
-| onlineenc_bdm | BDM | 本阶段最终因果 Encoder（v5） | 与在线方法共享 Base 协议 | **43.08** |
-| onlineenc_kmeans | K-means | 同上 | 同上 | 41.23 |
-| onlineenc_herding | Herding | 同上 | 同上 | 39.80 |
+| onlineenc_kmeans | K-means | 本阶段最终因果 Encoder（v5） | 与在线方法共享 Base 协议 | 41.23 |
 
-- 在同一最终 Encoder + 同一归一化协议下，离线一次 Batch DM 为 43.08，
-  在线最佳（replay 重编码 + DM）为 **43.19**，**在线处理代价已基本消失**（+0.11，种子波动内）。
-- 与第一阶段 49k 预训练 VAE 的 59.24 相差约 16 点，说明**当前最大瓶颈是
-  20% Base 训练出的编码器质量**，而不是蒸馏或同步机制。20 轮完整流式训练应显著缩小该差距。
+- 与第一阶段 49k 预训练 VAE 相比，当前 20% Base 编码器在同类基线方法上低约 17 点，
+  说明**当前最大瓶颈是编码器质量**，而不是蒸馏或同步机制。
+- 离线 Batch DM 参考需要按原版 DM 重跑；历史 mean+var 版本的结果已删除。
 
 ### 5.6 计算与通信
 
@@ -298,85 +305,100 @@ CIFAR-10 的 20% Base 已能训练出较强编码器，初始精度 **76.08±0.5
 本机（RTX 4090 D）5 轮单方法边缘总耗时约 30–100 s，峰值显存 <1 GB；
 云端 6 次训练合计约 2–3 s。完整同步累计约 6.1 MB，patch 10% 约 1.57 MB（理论字节）。
 
-图（`figures/`）：
+图（`figures/`，均由当前三方法结果生成）：
 
 - `cifar100_accuracy_iid.png`、`cifar100_communication_iid.png`、
   `cifar100_drift_alignment_iid.png`
-- `cifar100_accuracy_label_shift.png`、`cifar100_accuracy_covariate_shift.png`
 - `cifar10_accuracy_iid.png`、`cifar10_communication_iid.png`、
   `cifar10_drift_alignment_iid.png`
 
-### 5.7 变量分离实验（CIFAR-100 IID，seed 42）
+Label/Covariate Shift 的图在结果重跑后再生成。
 
-把“重编码”“代表集重建”“DM 更新”“上传预算”拆成独立变量：
+### 5.7 变量分离实验（CIFAR-100 IID，3 seeds）
 
-| 方法 | 最终 | 在线平均 | 累计通信 | 更新比例 | 上传比例 | 边缘/云端差异 |
-|---|---|---|---|---|---|---|
-| Replay-Reinit（只重编码 + KMeans） | 41.01 | 39.25 | 5.96 MB | 100% | 100% | 0 |
-| Replay + DM（重编码 + 初始化 + DM） | **43.21** | **41.34** | 5.96 MB | 100% | 100% | 0 |
-| Affine + DM（正确归一化空间） | 38.88 | 37.34 | 5.96 MB | 100% | 100% | 0 |
-| Affine + DM，100% 更新 / 10% 上传 | 37.21 | 35.48 | **1.54 MB** | 100% | 10% | 1.013 |
-| Affine + Partial DM，10% 更新 / 100% 上传 | 35.56 | 34.76 | 5.96 MB | 10% | 100% | 0 |
-| Affine + Partial DM，10% 更新 / 10% 上传 | 35.58 | 34.73 | **1.54 MB** | 10% | 10% | 0 |
+原先把“重编码 / 代表集重建 / DM 更新”拆成独立变量做过对照；
+只重编码 + KMeans 的 Replay-Reinit 与 Affine + DM 两个方法已删除，
+对应历史数字不再引用。
 
-四个问题的直接回答：
-
-1. **之前最强的 Replay 方法强在重编码，还是重新构建代表集？**
-   两者都重要，但可分开：只重编码 + KMeans 重建（Replay-Reinit）已经到 41.01；
-   在此基础上跑 Streaming DM 再 +2.20（43.21）。所以“Replay 强”主要来自**当前版本精确特征 + 重新初始化**，
-   DM 是明确的增量收益。
-2. **Alignment 失效是否与坐标转换有关？**
-   坐标 bug 已修（对齐在归一化空间拟合，held-out 误差相对“不对齐”下降约 25%），
-   但 `Affine + DM` 仍是 38.88，与冻结 VAE 39.05 基本持平。
-   说明对齐失效**不是坐标 bug 导致的**；主因是对角仿射在 5 轮/980 预算下不足以恢复历史代表的有效性。
-3. **DM 对旧代表集有没有额外收益？**
-   对“当前版本重编码”的代表集有 +2.20；对“跨版本对齐后的旧代表”只有约 +0.3。
-   结论：**DM 的价值依赖代表特征已经是当前版本**；在旧特征上做 DM 无法弥补对齐误差。
-4. **Patch 精度下降来自减少优化，还是限制上传？**
-   - 100/100：38.88
-   - 100/10：37.21（仅限制上传，−1.67）
-   - 10/100：35.56（仅减少更新，−3.32）
-   - 10/10：35.58（两者都限制，与 10/100 几乎相同）
-
-   **主要损失来自减少更新预算，而不是上传预算**。100/10 的 1.013 边缘/云端差异说明
-   本地代表领先云端，不能当作可部署协议；10/100 是全量上传、严格一致，但只更新 10% 仍掉 3.3 点。
-
-### 5.8 原版 DM（线性核均值匹配）对照
-
-原版 Distribution Matching 的主实验使用**线性核 MMD**，等价于匹配特征均值；
-本项目的 `l_mean` 正是均值差平方（与线性核 MMD² 成正比），因此“原版 DM”对应
-`lambda_var=0, lambda_anchor=0` 的变体。注意：这不是像素空间 DM（没有 decoder-in-the-loop
-与可微增强），而是在同一个 1024 维 VAE 特征空间里做线性核 DM。
-
-Stage 1（`vae_bdm`，CIFAR-10/100 10:1，3 seeds）：
-
-| 数据集 | 原版 DM（mean-only） | mean + var | 差异 |
+| 方法 | 最终 | 在线平均 | 累计通信 |
 |---|---|---|---|
-| CIFAR-100 | 60.08 | **60.37** | −0.29 |
-| CIFAR-10 | **90.01** | 89.85 | +0.16 |
+| Replay + 原版 DM（重编码 + 初始化 + DM） | **41.68±0.57** | **40.24±0.44** | 5.96 MB |
 
-Stage 2（CIFAR-100 IID，seed 42，full sync，100% 更新）：
+1. **DM 的价值依赖代表特征已经是当前版本**：Replay 重编码后再跑原版 DM 是当前唯一保留的配置。
+2. 更新/上传预算分离（patch / partial）的消融结果随旧目标一并删除，
+   需要按原版 DM 重跑后再补。
+
+### 5.8 原版 DM（固定随机 MLP 特征空间 + 均值匹配）
+
+原版 DM 是当前唯一保留的蒸馏目标（两阶段相同）：在 1024 维特征上再套一个
+**固定随机 MLP**，参数完全冻结，只让梯度穿过 synthetic 代表：
+
+```python
+feature_net = RandomMLP(input_dim=1024)
+feature_net.eval()
+for p in feature_net.parameters():
+    p.requires_grad_(False)
+
+real_feat = feature_net(real_z).detach()
+syn_feat = feature_net(synthetic_z)
+loss = (real_feat.mean(0) - syn_feat.mean(0)).pow(2).mean()
+```
+
+代码：`random_feature.py`；阶段一 `BatchDM`、阶段二 `StreamingDM` 都只走这一条路径。
+注意：这不是像素空间 DM（没有 decoder-in-the-loop、没有可微增强）。
+
+Stage 1（`vae_bdm`，10:1，3 个蒸馏种子 × 3 个云端种子）：
+
+| 数据集 | 原版 DM | Full | K-means + Moment |
+|---|---|---|---|
+| CIFAR-100 | 59.61±0.25 | 61.56±0.15 | **60.85±0.07** |
+| CIFAR-10 | 90.06±0.06 | 90.19±0.19 | 90.05±0.09 |
+
+Stage 2（CIFAR-100 IID，3 seeds，full sync，100% 更新）：
 
 | 方法 | 最终 | 在线平均 | 组/单图方差比 |
 |---|---|---|---|
-| Replay + DM（mean+var+anchor） | **43.21** | **41.34** | 0.65 |
-| Replay + 原版 DM（mean-only） | 42.83 | 40.68 | 0.44 |
-| Affine + DM（mean+var+anchor） | **38.88** | 37.34 | 1.00 |
-| Affine + 原版 DM（mean-only） | 38.74 | **37.62** | 0.26 |
+| Replay + 原版 DM | **41.68±0.57** | **40.24±0.44** | 0.48 |
 
 解读：
 
-1. **原版 DM 与 mean+var 差距很小**：C100 上 mean+var 略好（stage 1 −0.29，
-   stage 2 replay −0.38），C10 上 mean-only 略好（+0.16）。
-2. **均值匹配会收缩方差**：stage 2 中 mean-only 的方差比只有 0.26（affine）和 0.44（replay），
-   而 mean+var 恢复到 1.00/0.65。方差收缩不一定立即掉点，但会牺牲类内多样性。
-3. 原版 DM 在文献里的优势主要来自**强特征空间 + 像素增强 + 较大 IPC**；
-   在我们的 1024 维 VAE 潜空间、每类 10 个代表、无像素增强的条件下，
-   仅做均值匹配并不优于 mean+var，也没有解决对齐误差问题。
+1. 固定随机 MLP 在当前 1024 维 VAE 特征上，阶段一没有超过 Moment Calibration
+   （C100 低约 1.2 点，C10 在噪声内持平）；阶段二则明显领先（41.68 vs 39.46）。
+2. 原版 DM 的收益主要来自**训练好的特征提取器 + 像素增强 + 较大 IPC**；
+   当前阶段使用固定随机 MLP 是为了保持方法学一致，后续换用更强的特征提取器后
+   该方法才有比较意义。
+3. 纯均值匹配会收缩类内方差（stage 2 组/单图方差比 0.48）；
+   该比值只作为诊断指标记录，不参与训练目标。
+4. 阶段二的 real features：`dm` 用 replay + current，
+   覆盖当前版本下的历史与新增样本。
+
+### 5.9 长流 392 轮（CIFAR-10，class_quota=10，update_every=10，tag r392p2）
+
+单种子 42；392 轮恰好耗尽每类 3,920 张。末轮 flush（`final_flush=True`），
+`vae_pending_leftover=0`，`n_train_used=49,000`；四种方法 Encoder 轨迹逐位相同
+（r391 `encoder_sha1=de208c5776faa5e9`），累计通信 390,564 KB（993.8 KB/轮，INT8 full_sync）。
+
+| 方法 | 初始 | 最终 | 在线平均 | 最终 F1 | INT8 | 方差比 | 对齐误差 |
+|---|---|---|---|---|---|---|---|
+| online_kmeans | 75.97 | 74.09 | 74.60 | 73.74 | 73.48 | 0.033 | 0.129 |
+| online_moment | 75.97 | **77.83** | 75.56 | **77.61** | **77.83** | 1.000 | 0.129 |
+| dm | 75.97 | 76.88 | **75.76** | 76.75 | 76.87 | 2.756 | 0.129 |
+| online_moment（history_mode=replay 消融） | 75.97 | 77.10 | 75.71 | 77.03 | 77.04 | — | — |
+
+时间拆账（秒）：边缘计算 227–265，评估 94–102，云端训练 225–251，墙钟 601–643；
+非更新轮约 0.9 s，更新轮约 5 s。
+
+1. Moment 最终最好，DM 在线平均最高，K-means 低于初始（74.09 < 75.97），
+   需要单独排查 coreset / 质心更新。
+2. 消融：固定预算（replay+current，1,100 样本）比累计统计低 0.73，
+   Moment 的收益部分来自历史信息量，论文必须写清口径。
+3. 与修改前 `r392u10`（K-means 78.48 / Moment 78.37 / DM 81.11）差异较大：
+   DM 由 `reencode` 改为 `diagonal_affine` 可解释一部分，K-means 的差异尚无定论。
+   两组数字口径不同，不能混用；需要单变量对照（关闭 replay 去重、关闭末轮 flush）定位。
 
 ---
 
-## 6. 测试覆盖（任务书 19 项 + 7 项审计回归）
+## 6. 测试覆盖（任务书 19 项 + 6 项审计回归）
 
 | # | 检查 | 测试 |
 |---|---|---|
@@ -402,10 +424,9 @@ Stage 2（CIFAR-100 IID，seed 42，full sync，100% 更新）：
 | 20 | 对齐在 Normalized 空间拟合/应用 | `test_alignment_normalized_space` |
 | 21 | Base 缓存签名覆盖划分与架构 | `test_base_cache_signature_changes` |
 | 22 | 断点签名覆盖主要实验参数 | `test_resume_signature_covers_config` |
-| 23 | reencode 真正调用 StreamingDM | `test_reencode_runs_streaming_dm` |
+| 23 | DM 目标集合统一为 replay+current | `test_dm_target_scope_unified` |
 | 24 | 完整流水线断点恢复 exact 对齐 | `test_full_pipeline_resume` |
-| 25 | Replay-Reinit 仅重编码不跑 DM | `test_replay_reinit_baseline` |
-| 26 | 更新预算与上传预算分离 | `test_update_upload_budget_separation` |
+| 25 | 更新预算与上传预算分离 | `test_update_upload_budget_separation` |
 
 ---
 
@@ -424,12 +445,56 @@ Stage 2（CIFAR-100 IID，seed 42，full sync，100% 更新）：
 | P1-7 | 断点签名未覆盖主要参数 | **真风险**：改 `updates_per_class/cloud.lr/...` 后 resume 会静默复用旧状态 | 改为完整配置哈希；新增测试 22 |
 | P1-8 | Alignment 训练/测试误差未分离 | **部分成立**：MSE 已分离，但类中心误差用了全部锚点 | 分别报告 `fit_class_center_err` 与 held-out `class_center_err`；新增测试 20 |
 | P2-9 | 计时、INT8、恢复统计 | **部分成立**：评测编码未单列、resume 的 wall time 只算续跑段、INT8 测试口径未注明 | 拆分 `eval_encode_sec` / `test_int8_sec`；恢复累计 `wall_sec`；写入 `test_int8_note` |
-| 追加 | Reencode 与蒸馏未拆分 | **方法学问题**：重编码 + KMeans 被当成 Replay+DM | 新增 `replay_reinit`（只重编码+初始化）与 `replay_dm`（再跑 DM）两个独立方法；新增测试 25 |
+| 追加 | Reencode 与蒸馏未拆分 | **方法学问题**：重编码 + KMeans 被当成 Replay+DM | 拆出“只重编码+初始化”的对照；该对照后随方法收敛删除，只保留 `dm`（重编码 + 初始化 + 原版 DM） |
 | 追加 | 样本计数口径单一 | **审计问题**：无法区分“已见样本/有效统计/Replay” | 逐轮记录 `n_cumulative_seen / n_effective_stats / n_replay`；汇总写 `cumulative_seen_samples / effective_stats_samples / replay_samples_final` |
 | 追加 | 对齐只有误差，没有前/后对比 | **验证不足** | 记录 `no_align_heldout_mse`、`improvement_heldout`、`class_center_improvement`，直接验证对齐相对“不对齐”的增益 |
 
 修复后 `vae_streaming` 测试 28 项全过；受影响结果已整体重跑（旧结果保留在
 `results/_stale_pre_audit/`）。
+
+### 2026-11-17 第二轮审计（长流 392 轮）
+
+针对长流协议逐条复核，结论与修复：
+
+| 编号 | 问题 | 结论 | 修复 |
+|---|---|---|---|
+| P0-a | `update_every_rounds` 末轮处理 | **权衡后改为 flush**：392 是唯一精确耗尽每类 3,920 张的轮数，改为 390 会让 200 张永不进入流 | 末轮用余数样本补一次小 batch 更新（`vae.final_flush=True`）；`vae_pending_leftover` 只记录异常残留 |
+| P0-b | DM 每轮重初始化代表集 + 目标随版本跳变 | **真问题**：`reencode` 分支在更新轮用 K-means 重建代表集并改用 replay+current，非更新轮仅用 current | DM 改用 `diagonal_affine` 继承代表集；`exact_target=True` 每轮用当前 Encoder 精确重编码 replay+current；逐轮记录 `target_scope / n_target` |
+| P0-c | 三方法历史信息量不一致 | **真问题**：同轮 Moment `stats.n_seen≈26.5k`、DM `≈1.9k` | 新增 `stream.history_mode=full|replay` 消融口径；`replay` 用固定 1,000 replay+current 重建统计 |
+| P1-1 | 方法间 VAE 随机轨迹可能不同 | **风险**：在线更新消耗全局 RNG（torchvision 增强） | 更新包在 `torch.random.fork_rng` 内，按 `seed+1e6+7919·round` 独立播种；记录 `vae.encoder_sha1`，三方法逐轮哈希一致 |
+| P1-2 | Base 缓存签名不含 base 索引 | **加固**：缺失 `base_indices_sha1 / n_base`，`cache_version` 升到 3 | 签名加入 base 索引 SHA1 与样本数 |
+| P1-3 | `stats_scope` 日志误标 | **真问题**：未更新的轮次直接标 `aligned_full_history`，忽略历史是否曾被 reset | 跨轮维护 `stats_origin`，只在真正 reset 时降级；resume 时继承上一轮 |
+| P1-4 | `n_train_used` 用 `stats.n_seen` | **真问题**：可能只含 replay+current | `n_train_used` 改为实际累计已见；独立记录 `effective_stats_samples`；删除重复 `n_replay` 键 |
+| P1-5 | resume 仍做 Base 初始化 | **真问题**：先训练 Base/初始同步/初始云端训练再恢复 | 先探测断点，命中则只恢复状态，跳过全部初始化 |
+| P1-6 | 锚点抽样非严格分层 | **真问题**：类内连续存储时 `linspace` 可能漏类 | `_stratified_anchor_indices` 按类配额抽样；`n_anchors=0` 时跳过漂移/对齐 |
+| P1-7 | `test_domain()` 标签未使用 | **加固**（`test_domain` 目前恒等返回 `test_labels`） | 评估显式使用返回的 `dom_y` |
+| P2-1 | `partial` 判定 | **真问题**：停在最后一轮也可能标记未完成 | `completed_rounds < num_rounds` |
+| P2-2 | VAE checkpoint 覆盖 | **真问题**：未更新轮用同一版本号反复写 | 只在 `do_update` 时写 `vae_v{version}.pt`；结束按 `partial` 写 `vae_final.pt` / `vae_partial.pt` |
+| P2-3 | `anchor_count=0` 边界 | **真问题**：空锚点导致编码失败 | 显式跳过对齐，使用 identity + 0 漂移 |
+| P2-4 | `expected_seen_final` 忽略提前停止 | **真问题**：始终按全部轮次计算 | 按实际完成轮次计算 |
+
+> 未采纳：原清单中“随机特征 DM 未真正使用固定 MLP / 仅匹配均值”——已核对
+> `random_feature.py` 与 `streaming_dm.py`，参数 `requires_grad=False`、
+> 损失为逐类均值匹配 + 小权重锚点项，结论不成立。
+
+### 2026-11-17 第三轮审计（Replay 去重与统计口径）
+
+| 编号 | 问题 | 结论 | 修复 |
+|---|---|---|---|
+| A1 | Pending 与 Replay 重复 | **真问题**：更新轮 replay=第 0..t-1 轮、pending=第 t-9..t 轮，交集被重复计权 | Replay 条目记录轮次；VAE 更新用 `exclude_rounds=pending_rounds`，DM/锚点仍用完整 Replay |
+| A2 | 末轮余数未训练 | **真问题**：392%10=2，最后 200 张只进统计/同步 | 末轮强制 flush（`vae.final_flush=True`），`vae_pending_leftover` 归零 |
+| A3 | 分层锚点配额不回补 | **真问题**（主实验不触发）：容量不足时直接截断 | water-filling 重新分配剩余名额，锚点数达到 `anchor_count` |
+| A4 | 三方法历史信息不同 | **设计差异**：Moment 累计统计信息量与 DM/K-means 固定预算不同 | 保留 `--history-mode replay` 消融；论文按“整套算法”表述，不宣称同预算 |
+| A5 | DM 未用累计统计 | **属实** | 不新增变体：DM 定义为 Replay+Current 随机特征均值匹配，Statistical Memory 只归属 Moment |
+| A6 | 随机特征 DM 实现 | **不成立**：固定 seed 0 的 `RandomMLP`，`requires_grad=False` + `eval()`，`no_grad` 下算目标均值 | 论文注明随机网络跨种子固定 |
+| A7 | NumPy / Python RNG 未隔离 | **不成立**：VAE 路径只用 torch RNG，全部在 `fork_rng` 内；各组件用独立 `RandomState` 并随断点持久化 | 无需修改 |
+| A8 | Patch 优化/上传比例耦合 | **潜在问题**：`update_fraction` 与 `patch_fraction` 不同时仍复用 `patch_idx` | 两者各自调用 `select_patch_indices`（现有配置不触发） |
+| A9 | 部分运行写 `vae_final.pt` | **真问题**：中断权重可能被误认作完整结果 | 按 `partial` 命名 `vae_partial.pt` |
+| A10 | `edge_total_sec` 混入非边缘耗时 | **真问题**：原值是整段墙钟（含云端训练/评估） | 拆为 `edge_train_sec` / `edge_total_sec` / `eval_total_sec` / `cloud_total_sec` / `wall_total_sec` |
+
+> 验证：3 轮 `update_every=2` smoke 中 r2 出现 `final_flush=True`、`n_vae_batch=100`、
+> `vae_pending_leftover=0`、`n_anchors=200`；DM `target_scope=replay_plus_current`、
+> `n_target=1100`；`edge_total_sec=12.1` 与 `wall_total_sec=12.9`、`cloud=0.04`、`eval=0.7` 分离。
 
 ---
 

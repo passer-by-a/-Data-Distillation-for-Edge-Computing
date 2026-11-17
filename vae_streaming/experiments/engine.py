@@ -27,8 +27,7 @@ from ..communication.payload_accounting import (CommunicationLedger,
 from ..communication.quantization import decode_features, encode_features
 from ..data.causal_stream import CausalStream
 from ..distillation.moment_calibration import streaming_moment_calibrate
-from ..distillation.online_coreset import (OnlineHerding, OnlineKMeans,
-                                           ReservoirCoreset, build_coreset)
+from ..distillation.online_coreset import OnlineKMeans, build_coreset
 from ..distillation.streaming_dm import StreamingDM
 from ..memory.replay_buffer import ClassBalancedReservoir
 from ..memory.representative_memory import RepresentativeMemory
@@ -42,125 +41,32 @@ from ..config_utils import checkpoint_path, result_path
 
 
 METHOD_OVERRIDES = {
-    "frozen_stream_dm": {
-        "vae": {"online_update": False, "replay_enabled": False,
-                "replay_ratio": 0.0},
-        "alignment": {"method": "none"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"}},
-    "online_naive_dm": {
-        "vae": {"online_update": True, "replay_enabled": False,
-                "replay_ratio": 0.0},
-        "alignment": {"method": "none"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"}},
-    "online_replay_dm": {
+    # 原版 DM：固定随机 MLP 特征空间中的均值匹配（唯一 DM 目标）
+    "dm": {
         "vae": {"online_update": True, "replay_enabled": True,
                 "replay_ratio": 0.25},
-        "alignment": {"method": "reencode"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"}},
-    # ---- 拆变量后的显式方法名 ----
-    "replay_reinit": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "reencode"},
-        "distillation": {"method": "reinit"},
-        "communication": {"mode": "full_sync"}},
-    "replay_dm": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "reencode"},
-        "distillation": {"method": "dm", "update_fraction": 1.0},
-        "communication": {"mode": "full_sync"}},
-    "affine_dm": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
+        # 与 K-means / Moment 使用同一套 drift 对齐机制，代表集跨版本继承，
+        # 不再每轮用 K-means 重建（避免丢失上一轮蒸馏结果）
         "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm", "update_fraction": 1.0},
-        "communication": {"mode": "full_sync"}},
-    # 原版 DM（线性核 MMD = 特征均值匹配，无方差/anchor 项）
-    "replay_dm_mean": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "reencode"},
+        # DM 目标每轮都用当前 encoder 精确重编码 replay+current，
+        # 保证更新轮与非更新轮的目标集合一致
         "distillation": {"method": "dm", "update_fraction": 1.0,
-                         "lambda_var": 0.0, "lambda_anchor": 0.0},
+                         "exact_target": True},
         "communication": {"mode": "full_sync"}},
-    "affine_dm_mean": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm", "update_fraction": 1.0,
-                         "lambda_var": 0.0, "lambda_anchor": 0.0},
-        "communication": {"mode": "full_sync"}},
-    "affine_dm_patch_100up_10tx": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm", "update_fraction": 1.0},
-        "communication": {"mode": "patch", "patch_fraction": 0.10}},
-    "affine_dm_partial_10up_100tx": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm", "update_fraction": 0.10},
-        "communication": {"mode": "full_sync"}},
-    "affine_dm_partial_10up_10tx": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm", "update_fraction": 0.10},
-        "communication": {"mode": "patch", "patch_fraction": 0.10}},
-    "online_replay_align_dm": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"}},
+    # 在线 K-means：流式质心
     "online_kmeans": {
         "vae": {"online_update": True, "replay_enabled": True,
                 "replay_ratio": 0.25},
         "alignment": {"method": "diagonal_affine"},
         "distillation": {"method": "kmeans"},
         "communication": {"mode": "full_sync"}},
-    "online_herding": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "herding"},
-        "communication": {"mode": "full_sync"}},
-    "online_reservoir": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "reservoir"},
-        "communication": {"mode": "full_sync"}},
+    # 在线矩匹配：解析式均值/方差校准
     "online_moment": {
         "vae": {"online_update": True, "replay_enabled": True,
                 "replay_ratio": 0.25},
         "alignment": {"method": "diagonal_affine"},
         "distillation": {"method": "moment"},
         "communication": {"mode": "full_sync"}},
-    "full_method": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "patch"}},
-    "full_method_full_sync": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"}},
-    "online_replay_align_scratch_cloud": {
-        "vae": {"online_update": True, "replay_enabled": True,
-                "replay_ratio": 0.25},
-        "alignment": {"method": "diagonal_affine"},
-        "distillation": {"method": "dm"},
-        "communication": {"mode": "full_sync"},
-        "cloud": {"incremental_training": False}},
 }
 
 
@@ -194,6 +100,70 @@ def _mask_acc(pred, labels, mask):
     return float((pred[mask] == labels[mask]).float().mean().item() * 100)
 
 
+def _encoder_sha1(encoder):
+    """Encoder 参数指纹：用于核对三种方法是否共享同一 VAE 轨迹"""
+    h = hashlib.sha1()
+    sd = encoder.state_dict()
+    for k in sorted(sd):
+        t = sd[k].detach().cpu().contiguous()
+        h.update(k.encode())
+        h.update(t.numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def _stratified_anchor_indices(labels, n_a, num_classes):
+    """按类别分层抽取锚点索引（Replay 按类别连续存储）。
+
+    配额按类别样本量分配；某类容量不足时把剩余名额重新分配给仍有余量的
+    类别（water-filling），保证锚点数量尽量达到 n_a。
+    预算不足以覆盖所有类别时退化为均匀抽样。
+    """
+    labels = torch.as_tensor(labels).long().flatten()
+    n = int(len(labels))
+    n_a = min(int(n_a), n)
+    if n_a <= 0:
+        return torch.empty(0, dtype=torch.long)
+    present = [c for c in range(int(num_classes)) if bool((labels == c).any())]
+    if not present:
+        return torch.empty(0, dtype=torch.long)
+    if n_a < len(present):
+        return torch.linspace(0, n - 1, n_a).long().unique()
+    idx_by_class = [torch.nonzero(labels == c, as_tuple=False).flatten()
+                    for c in present]
+    counts = torch.tensor([len(x) for x in idx_by_class], dtype=torch.long)
+    quota = torch.ones(len(present), dtype=torch.long)
+    left = n_a - len(present)
+    while left > 0:
+        spare = counts - quota                      # 各类还能再分配的名额
+        total_spare = int(spare.sum())
+        if total_spare <= 0:
+            break
+        share = spare.double() / total_spare * left
+        add = torch.minimum(share.floor().long(), spare)
+        if int(add.sum()) == 0:
+            # 名额过少时按剩余容量逐个补齐
+            add = torch.zeros_like(spare)
+            order = torch.argsort(-spare)
+            for j in range(min(left, total_spare)):
+                add[int(order[j])] += 1
+        quota += add
+        left -= int(add.sum())
+    sel = []
+    for i, idx in enumerate(idx_by_class):
+        k = int(quota[i])
+        sel.append(idx[torch.linspace(0, len(idx) - 1, k).long().unique()])
+    return torch.cat(sel)
+
+
+def _save_vae_ckpt(path, vae, version, tag, seed, round_idx, n_seen, stream):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({"model_state_dict": vae.state_dict(),
+                "encoder_version": int(version), "method": tag,
+                "seed": int(seed), "round": int(round_idx),
+                "accessible_rounds": f"initial_base + rounds 0..{round_idx}",
+                "n_seen": int(n_seen), "stream": stream.summary()}, path)
+
+
 def _build_stream(cfg):
     s = cfg["stream"]
     return CausalStream(
@@ -204,7 +174,8 @@ def _build_stream(cfg):
         class_balanced_initial=bool(s.get("class_balanced_initial", True)),
         scenario=s.get("scenario", "iid"),
         val_ratio=float(cfg["val_ratio"]),
-        split_seed=int(cfg["split_seed"]))
+        split_seed=int(cfg["split_seed"]),
+        class_quota=s.get("class_quota"))
 
 
 def _state_signature(cfg, tag, seed):
@@ -218,12 +189,14 @@ def _state_signature(cfg, tag, seed):
         json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def _base_signature(cfg, seed):
+def _base_signature(cfg, seed, stream):
     """Initial Base VAE 缓存签名：包含数据划分、架构与训练超参"""
     v = cfg["vae"]
     s = cfg["stream"]
+    base_idx = np.asarray(sorted(int(i) for i in stream.base_indices),
+                          dtype=np.int64)
     return {
-        "cache_version": 2,
+        "cache_version": 3,
         "dataset": cfg["dataset"], "num_classes": int(cfg["num_classes"]),
         "latent_dim": int(cfg["latent_dim"]),
         "base_channels": int(cfg["base_channels"]),
@@ -233,6 +206,12 @@ def _base_signature(cfg, seed):
         "split_seed": int(cfg["split_seed"]),
         "val_ratio": float(cfg["val_ratio"]),
         "class_balanced_initial": bool(s.get("class_balanced_initial", True)),
+        "class_quota": s.get("class_quota"),
+        # 配额模式下 base 大小依赖轮数
+        "class_quota_rounds": int(s["num_rounds"]) if s.get("class_quota") else None,
+        # 直接校验 base 样本索引本身，避免数据划分实现变化后误用旧缓存
+        "base_indices_sha1": hashlib.sha1(base_idx.tobytes()).hexdigest()[:16],
+        "n_base": int(len(base_idx)),
         "initial_epochs": int(v["initial_epochs"]),
         "batch_size": int(v["batch_size"]),
         "lr": float(v["lr"]), "beta": float(v["beta"]),
@@ -243,10 +222,13 @@ def _base_signature(cfg, seed):
 
 def _save_run_state(path, *, vae, version, last_round, protocol, memory,
                     statistics, replay, cloud, learner, coreset, ledger,
-                    rounds_log, edge_sec, peak_gpu, signature, wall_sec=0.0):
+                    rounds_log, edge_sec, peak_gpu, signature, wall_sec=0.0,
+                    pending_vae=None, pending_rounds=None):
     torch.save({
         "signature": signature, "vae": vae.state_dict(),
         "version": int(version), "last_round": int(last_round),
+        "pending_vae": pending_vae,
+        "pending_rounds": list(pending_rounds or []),
         "protocol_mean": protocol.mean.clone(),
         "protocol_std": protocol.std.clone(),
         "memory": memory.state_dict(), "statistics": statistics.state_dict(),
@@ -289,6 +271,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     distill = cfg["distillation"]["method"]
     sync_mode = cfg["communication"]["mode"]
     quant_mode = cfg["communication"]["quantization"]
+    cloud_mode = "incremental" if cfg["cloud"].get(
+        "incremental_training", True) else "scratch"
     patch_fraction = float(cfg["communication"].get("patch_fraction", 0.10))
     update_fraction = cfg["distillation"].get("update_fraction")
     if update_fraction is None:
@@ -302,12 +286,24 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     if not 0.0 < update_fraction <= 1.0:
         raise ValueError(f"update_fraction 必须在 (0,1]，实际 {update_fraction}")
     vae_update = bool(vcfg.get("online_update", True))
+    # 累积若干轮再做一次在线更新：小批量流式场景下避免反复看极少数样本
+    update_every = max(1, int(vcfg.get("update_every_rounds", 1)))
     replay_enabled = bool(vcfg.get("replay_enabled", True))
     anchor_count = int(cfg["alignment"].get("anchor_count", 200))
     anchor_count = min(anchor_count, int(cfg["memory"]["raw_replay_capacity"]))
+    # 历史预算口径: full=累计全部历史（base+每轮）；replay=固定预算 replay+current
+    history_mode = str(cfg["stream"].get("history_mode", "full"))
+    if history_mode not in ("full", "replay"):
+        raise ValueError(f"history_mode 只能是 full / replay，实际 {history_mode}")
+    # DM 精确目标：每轮都用当前 encoder 重编码 replay+current 作为同一目标集合
+    dm_exact = distill == "dm" and bool(
+        cfg["distillation"].get("exact_target", False))
     signature = _state_signature(cfg, tag, seed)
 
     stream = _build_stream(cfg)
+    base_sig = _base_signature(cfg, seed, stream)
+    ckpt0 = checkpoint_path(
+        cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt")
     if verbose:
         print(f"[{tag}] {cfg['dataset']} {stream.scenario} "
               f"base={len(stream.base_indices)} rounds={stream.num_rounds} "
@@ -316,169 +312,187 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
     t_start = time.time()
     base = stream.base
-    vae = build_vae(C, int(cfg["latent_dim"]), int(cfg["base_channels"]),
-                    seed=int(seed), device=device)
-    base_sig = _base_signature(cfg, seed)
-    base_hash = hashlib.sha1(
-        json.dumps(base_sig, sort_keys=True).encode()).hexdigest()[:16]
-    base_ckpt = os.path.join(cfg["checkpoints_dir"], cfg["dataset"],
-                             "base_vae",
-                             f"base_{cfg['dataset']}_{base_hash}.pt")
-    cached = False
-    if bool(vcfg.get("cache_base", True)) and os.path.exists(base_ckpt):
-        obj = torch.load(base_ckpt, map_location=device, weights_only=True)
-        if obj.get("base_signature") == base_sig:
-            vae.load_state_dict(obj["model_state_dict"])
-            base_log = obj["base_log"]
-            base_log["cached"] = True
-            cached = True
-            if verbose:
-                print(f"  [base VAE] 复用缓存 "
-                      f"{os.path.relpath(base_ckpt, os.getcwd())}", flush=True)
-    if not cached:
-        base_log = train_initial_vae(vae, base.images, base.labels, cfg, device,
-                                     verbose=verbose)
-        os.makedirs(os.path.dirname(base_ckpt), exist_ok=True)
-        torch.save({"model_state_dict": vae.state_dict(),
-                    "base_log": base_log, "base_signature": base_sig,
-                    "seed": int(seed),
-                    "accessible": "initial_base_only"}, base_ckpt)
-    vae.eval()
-
-    base_raw = encode_mu(vae.encoder, base.images, device=device)
-    protocol = FeatureProtocol.fit(base_raw)
-    base_feats = protocol.normalize(base_raw)
-
-    quotas = allocate_quotas(base.labels.numpy(), budget, C)
-    memory = RepresentativeMemory(budget, C, quotas, dim)
-    memory.initialize_from_features(
-        base_feats, base.labels,
-        method=cfg["memory"].get("representative_init", "kmeans"),
-        version=0, seed=int(seed), device=device,
-        cfg=cfg["distillation"])
-
-    stats = StreamingStatistics(C, dim, version=0)
-    stats.update(base_feats, base.labels, 0, round_idx=-1)
-
-    replay = ClassBalancedReservoir(
-        int(cfg["memory"]["raw_replay_capacity"]), C,
-        class_balanced=cfg["memory"].get("replay_strategy",
-                                         "class_balanced") == "class_balanced",
-        seed=int(seed))
-    replay.add_batch(base.images, base.labels)
-
-    coreset = None
-    if distill in ("kmeans", "herding", "reservoir"):
-        coreset = build_coreset(distill, memory.features, memory.labels,
-                                quotas, dim=dim, seed=int(seed))
-
-    cloud = CloudState.empty(budget, dim)
-    learner = IncrementalCloudLearner(cfg, dim, C, device=device)
-    ledger = CommunicationLedger()
-
-    # ---------------- 初始完整同步 ----------------
-    msg, _ = build_sync_message("full_sync", -1, memory, None, quant_mode,
-                                patch_fraction)
-    size = message_size(msg)
-    ledger.add("initial_sync", -1, size)
-    cloud.apply(msg)
-    header = json.loads(msg["meta"])
-    decoded = decode_features(msg["features"], header["quant"])
-    memory.set_submitted(np.arange(budget), decoded, 0)
-    init_verify = cloud.verify_consistent(memory)
-    if not init_verify["all_ok"]:
-        raise RuntimeError(f"初始同步不一致: {init_verify}")
-
-    ckpt0 = checkpoint_path(
-        cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt")
-    if save:
-        torch.save({"model_state_dict": vae.state_dict(),
-                    "encoder_version": 0, "method": tag, "seed": int(seed),
-                    "accessible_rounds": "initial_base_only",
-                    "n_base": int(len(base.labels)),
-                    "stream": stream.summary()}, ckpt0)
-
-    val_feats = protocol.normalize(
-        encode_mu(vae.encoder, stream.val_images, device=device))
-    test_feats = protocol.normalize(
-        encode_mu(vae.encoder, stream.test_images, device=device))
-    cloud_mode = "incremental" if cfg["cloud"].get("incremental_training",
-                                                   True) else "scratch"
-    cloud_init = learner.update(cloud.features, cloud.labels, val_feats,
-                                stream.val_labels, round_idx=-1,
-                                mode=cloud_mode)
-    init_metrics = learner.evaluate(test_feats, stream.test_labels)
-    peak_gpu = 0.0
-    if device == "cuda":
-        peak_gpu = torch.cuda.max_memory_allocated() / 1e9
-
-    initial_record = {
-        "round": -1, "encoder_version": 0,
-        "base_vae_log": base_log,
-        "feat_norm_protocol": protocol.meta(),
-        "memory": memory.summary(stats),
-        "statistics": stats.summary(),
-        "cloud": cloud_init,
-        "acc": init_metrics["acc"], "f1": init_metrics["f1"],
-        "sync_bytes": size,
-        "sync_verify": init_verify,
-    }
-    rounds_log = [initial_record]
-    edge_sec = base_log["train_sec"]
     state_path = checkpoint_path(
         cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/stream_state.pt")
-    # 让在线阶段的随机性独立于 base 权重是否来自缓存
-    _seed_everything(int(seed) + 1_000_003)
-
-    version = 0
-    peak_gpu = max(peak_gpu, 0.0)
-    start_round = 0
-    wall_sec = 0.0
+    # 先探测断点：命中时跳过 base 训练、初始同步与初始云端训练
+    st = None
     if resume and os.path.exists(state_path):
         st = torch.load(state_path, map_location="cpu", weights_only=False)
         if st["signature"] != signature:
             raise ValueError("断点状态与当前配置签名不一致，拒绝续跑")
+    resuming = st is not None
+
+    vae = build_vae(C, int(cfg["latent_dim"]), int(cfg["base_channels"]),
+                    seed=int(seed), device=device)
+    if resuming:
         vae.load_state_dict(st["vae"])
+        base_log = copy.deepcopy(st["rounds_log"][0].get("base_vae_log", {}))
+    else:
+        base_hash = hashlib.sha1(
+            json.dumps(base_sig, sort_keys=True).encode()).hexdigest()[:16]
+        base_ckpt = os.path.join(cfg["checkpoints_dir"], cfg["dataset"],
+                                 "base_vae",
+                                 f"base_{cfg['dataset']}_{base_hash}.pt")
+        cached = False
+        if bool(vcfg.get("cache_base", True)) and os.path.exists(base_ckpt):
+            obj = torch.load(base_ckpt, map_location=device, weights_only=True)
+            if obj.get("base_signature") == base_sig:
+                vae.load_state_dict(obj["model_state_dict"])
+                base_log = obj["base_log"]
+                base_log["cached"] = True
+                cached = True
+                if verbose:
+                    print(f"  [base VAE] 复用缓存 "
+                          f"{os.path.relpath(base_ckpt, os.getcwd())}",
+                          flush=True)
+        if not cached:
+            base_log = train_initial_vae(vae, base.images, base.labels, cfg,
+                                         device, verbose=verbose)
+            os.makedirs(os.path.dirname(base_ckpt), exist_ok=True)
+            torch.save({"model_state_dict": vae.state_dict(),
+                        "base_log": base_log, "base_signature": base_sig,
+                        "seed": int(seed),
+                        "accessible": "initial_base_only"}, base_ckpt)
+    vae.eval()
+
+    quotas = allocate_quotas(base.labels.numpy(), budget, C)
+    peak_gpu = 0.0
+    if resuming:
         protocol = FeatureProtocol(st["protocol_mean"], st["protocol_std"])
         memory = RepresentativeMemory.from_state_dict(st["memory"])
         stats = StreamingStatistics.from_state_dict(st["statistics"])
         replay = ClassBalancedReservoir.from_state_dict(st["replay"])
         cloud = CloudState.from_state_dict(st["cloud"])
+        learner = IncrementalCloudLearner(cfg, dim, C, device=device)
         learner.load_state_dict(st["learner"])
         ledger = CommunicationLedger()
         ledger.entries = copy.deepcopy(st["ledger"])
-        if st.get("coreset") is not None:
-            if distill == "kmeans":
-                coreset = OnlineKMeans.from_state_dict(st["coreset"])
-            elif distill == "herding":
-                coreset = OnlineHerding.from_state_dict(st["coreset"])
-            elif distill == "reservoir":
-                coreset = ReservoirCoreset.from_state_dict(st["coreset"])
+        if distill == "kmeans":
+            if st.get("coreset") is None:
+                raise ValueError("断点缺少 kmeans coreset 状态")
+            coreset = OnlineKMeans.from_state_dict(st["coreset"])
+        else:
+            coreset = None
         rounds_log = copy.deepcopy(st["rounds_log"])
-        edge_sec = st["edge_sec"]
-        peak_gpu = max(peak_gpu, st["peak_gpu"])
+        pending_vae = st.get("pending_vae")
+        pending_rounds = [int(r) for r in (st.get("pending_rounds") or [])]
+        if pending_vae is not None and not pending_rounds:
+            # 旧断点无轮次记录：按 update_every 反推
+            k = (int(st["last_round"]) + 1) % update_every or update_every
+            pending_rounds = list(range(int(st["last_round"]) - k + 1,
+                                        int(st["last_round"]) + 1))
+        edge_sec = float(st["edge_sec"])
         wall_sec = float(st.get("wall_sec", 0.0))
         version = int(st["version"])
         start_round = int(st["last_round"]) + 1
         stream._base_accessed = True
         stream._max_accessed = int(st["last_round"])
+        # 让在线阶段的随机性独立于 base 权重是否来自缓存
+        _seed_everything(int(seed) + 1_000_003)
         torch.set_rng_state(st["torch_rng"])
         if device == "cuda" and st.get("cuda_rng") is not None:
             torch.cuda.set_rng_state_all(st["cuda_rng"])
         np.random.set_state(st["np_rng"])
+        peak_gpu = max(peak_gpu, float(st["peak_gpu"]))
         vae.eval()
         if verbose:
             print(f"  [resume] 从第 {start_round} 轮继续 "
                   f"(已完成 {start_round}/{stream.num_rounds})", flush=True)
-    elif save:
-        _save_run_state(state_path, vae=vae, version=version, last_round=-1,
-                        protocol=protocol, memory=memory, statistics=stats,
-                        replay=replay, cloud=cloud, learner=learner,
-                        coreset=coreset, ledger=ledger, rounds_log=rounds_log,
-                        edge_sec=edge_sec, peak_gpu=peak_gpu,
-                        signature=signature,
-                        wall_sec=wall_sec + (time.time() - t_start))
+    else:
+        base_raw = encode_mu(vae.encoder, base.images, device=device)
+        protocol = FeatureProtocol.fit(base_raw)
+        base_feats = protocol.normalize(base_raw)
 
+        memory = RepresentativeMemory(budget, C, quotas, dim)
+        memory.initialize_from_features(
+            base_feats, base.labels,
+            method=cfg["memory"].get("representative_init", "kmeans"),
+            version=0, seed=int(seed), device=device,
+            cfg=cfg["distillation"])
+
+        stats = StreamingStatistics(C, dim, version=0)
+        stats.update(base_feats, base.labels, 0, round_idx=-1)
+
+        replay = ClassBalancedReservoir(
+            int(cfg["memory"]["raw_replay_capacity"]), C,
+            class_balanced=cfg["memory"].get("replay_strategy",
+                                             "class_balanced") == "class_balanced",
+            seed=int(seed))
+        replay.add_batch(base.images, base.labels)
+
+        coreset = None
+        if distill == "kmeans":
+            coreset = build_coreset(distill, memory.features, memory.labels,
+                                    quotas, dim=dim, seed=int(seed))
+
+        cloud = CloudState.empty(budget, dim)
+        learner = IncrementalCloudLearner(cfg, dim, C, device=device)
+        ledger = CommunicationLedger()
+
+        # ---------------- 初始完整同步 ----------------
+        msg, _ = build_sync_message("full_sync", -1, memory, None, quant_mode,
+                                    patch_fraction)
+        size = message_size(msg)
+        ledger.add("initial_sync", -1, size)
+        cloud.apply(msg)
+        header = json.loads(msg["meta"])
+        decoded = decode_features(msg["features"], header["quant"])
+        memory.set_submitted(np.arange(budget), decoded, 0)
+        init_verify = cloud.verify_consistent(memory)
+        if not init_verify["all_ok"]:
+            raise RuntimeError(f"初始同步不一致: {init_verify}")
+
+        if save:
+            _save_vae_ckpt(ckpt0, vae, 0, tag, seed, -1,
+                           int(len(base.labels)), stream)
+
+        val_feats = protocol.normalize(
+            encode_mu(vae.encoder, stream.val_images, device=device))
+        test_feats = protocol.normalize(
+            encode_mu(vae.encoder, stream.test_images, device=device))
+        cloud_init = learner.update(cloud.features, cloud.labels, val_feats,
+                                    stream.val_labels, round_idx=-1,
+                                    mode=cloud_mode)
+        init_metrics = learner.evaluate(test_feats, stream.test_labels)
+        if device == "cuda":
+            peak_gpu = torch.cuda.max_memory_allocated() / 1e9
+
+        initial_record = {
+            "round": -1, "encoder_version": 0,
+            "base_vae_log": base_log,
+            "feat_norm_protocol": protocol.meta(),
+            "memory": memory.summary(stats),
+            "statistics": stats.summary(),
+            "cloud": cloud_init,
+            "acc": init_metrics["acc"], "f1": init_metrics["f1"],
+            "sync_bytes": size,
+            "sync_verify": init_verify,
+        }
+        rounds_log = [initial_record]
+        edge_sec = base_log["train_sec"]
+        # 让在线阶段的随机性独立于 base 权重是否来自缓存
+        _seed_everything(int(seed) + 1_000_003)
+
+        version = 0
+        start_round = 0
+        wall_sec = 0.0
+        pending_vae = None
+        pending_rounds = []
+        if save:
+            _save_run_state(state_path, vae=vae, version=version, last_round=-1,
+                            protocol=protocol, memory=memory, statistics=stats,
+                            replay=replay, cloud=cloud, learner=learner,
+                            coreset=coreset, ledger=ledger, rounds_log=rounds_log,
+                            edge_sec=edge_sec, peak_gpu=peak_gpu,
+                            signature=signature,
+                            wall_sec=wall_sec + (time.time() - t_start),
+                            pending_rounds=pending_rounds)
+
+    # 统计来源（跨轮保持）：只有真正发生 reset 才降级，不因当前轮未更新而误标
+    stats_origin = "aligned_full_history"
+    if resuming and rounds_log:
+        stats_origin = rounds_log[-1].get("stats_scope", stats_origin)
+    ck = ckpt0
     for t in range(start_round, stream.num_rounds):
         if device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -486,69 +500,119 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         current = stream.round(t)
         prev_encoder = snapshot_encoder(vae, version)
 
+        # 累积本轮样本；每 update_every 轮做一次在线更新。
+        # 末轮强制 flush：392 轮下余数轮（2 轮）的样本也必须进入一次更新，
+        # 否则这部分数据不参与任何 VAE 梯度（batch 会小于常规更新）。
+        if vae_update:
+            if pending_vae is None:
+                pending_vae = (current.images.clone(), current.labels.clone())
+            else:
+                pending_vae = (torch.cat([pending_vae[0], current.images], 0),
+                               torch.cat([pending_vae[1], current.labels], 0))
+            pending_rounds.append(int(t))
+        final_flush = bool(vae_update and (t + 1) % update_every != 0
+                           and t == stream.num_rounds - 1)
+        do_update = vae_update and ((t + 1) % update_every == 0 or final_flush)
+
         # ---------------- Online VAE ----------------
         vae_sec = 0.0
-        vlog = {"skipped": True}
-        rep_imgs, rep_labels = replay.get()
-        if vae_update:
+        n_update_batch = int(len(pending_vae[1])) \
+            if (do_update and pending_vae is not None) else 0
+        vlog = {"skipped": True, "update_every_rounds": update_every}
+        rep_imgs, rep_labels = replay.get()   # DM / 锚点：允许含当前窗口
+        if do_update:
+            # 历史 Replay 必须排除仍在 pending 中的轮次，否则同一批样本会
+            # 同时作为“当前数据”和“replay”进入同一个训练 batch
+            if replay_enabled and pending_rounds:
+                vae_rep_imgs, vae_rep_labels = replay.get(
+                    exclude_rounds=pending_rounds)
+            else:
+                vae_rep_imgs, vae_rep_labels = rep_imgs, rep_labels
             if not replay_enabled:
-                rep_imgs = torch.empty(0, 3, 32, 32, dtype=torch.uint8)
-                rep_labels = torch.empty(0, dtype=torch.long)
-            vlog = online_vae_update(vae, current.images, current.labels,
-                                     rep_imgs, rep_labels, prev_encoder, cfg,
-                                     device=device, round_idx=t)
+                vae_rep_imgs = torch.empty(0, 3, 32, 32, dtype=torch.uint8)
+                vae_rep_labels = torch.empty(0, dtype=torch.long)
+            # 独立随机流：在线更新（含 torchvision 增强）不得推进全局 RNG，
+            # 否则三种方法会得到不同的后续 VAE 随机轨迹
+            rng_seed = int(seed) + 1_000_003 + 7919 * t
+            rng_devs = [] if device == "cpu" else [torch.cuda.current_device()]
+            with torch.random.fork_rng(devices=rng_devs):
+                torch.manual_seed(rng_seed)
+                if device != "cpu":
+                    torch.cuda.manual_seed(rng_seed)
+                vlog = online_vae_update(vae, pending_vae[0], pending_vae[1],
+                                         vae_rep_imgs, vae_rep_labels,
+                                         prev_encoder, cfg,
+                                         device=device, round_idx=t)
+            vlog["update_every_rounds"] = update_every
+            vlog["final_flush"] = bool(final_flush)
+            vlog["n_accumulated"] = n_update_batch
+            vlog["encoder_sha1"] = _encoder_sha1(vae.encoder)
             vae_sec = vlog["train_sec"]
             edge_sec += vae_sec
+            pending_vae = None
+            pending_rounds = []
         vae.eval()
-        new_version = version + 1 if vae_update else version
+        new_version = version + 1 if do_update else version
 
         # ---------------- Anchors / Drift / Alignment ----------------
         anchors_img, anchors_y = replay.get()
         if len(anchors_img) == 0:
             anchors_img, anchors_y = current.images, current.labels
         n_a = min(anchor_count, len(anchors_img))
-        # 均匀抽取，保证锚点覆盖各类别（Replay 按类别分组存储）
-        sel = torch.linspace(0, len(anchors_img) - 1, n_a).long().unique()
+        # 类别分层抽样，保证每个有样本的类别都被锚点覆盖
+        sel = _stratified_anchor_indices(anchors_y, n_a, C)
         anchors_img, anchors_y = anchors_img[sel], anchors_y[sel]
         n_a = len(sel)
         ta = time.time()
-        raw_old = encode_mu(prev_encoder, anchors_img, device=device)
-        raw_new = encode_mu(vae.encoder, anchors_img, device=device)
-        z_old = raw_old.flatten(1)
-        z_new = raw_new.flatten(1)
-        n_old = protocol.normalize(raw_old)
-        n_new = protocol.normalize(raw_new)
-        anchor_drift = {
-            "mse": float((z_new - z_old).pow(2).mean()),
-            "relative": float((z_new - z_old).pow(2).mean() /
-                              z_new.pow(2).mean().clamp_min(1e-8)),
-            "relative_norm": float((n_new - n_old).pow(2).mean() /
-                                   n_new.pow(2).mean().clamp_min(1e-8)),
-            "cosine": float(torch.nn.functional.cosine_similarity(
-                z_old, z_new, dim=1).mean())}
-        if vae_update and align_mode == "diagonal_affine":
-            alignment = estimate_feature_alignment(
-                prev_encoder, vae.encoder, anchors_img, anchors_y,
-                version_from=version, version_to=new_version,
-                max_scale=float(cfg["alignment"].get("max_scale", 3.0)),
-                method="diagonal_affine", device=device, protocol=protocol)
-        else:
+        if n_a == 0:
+            anchor_drift = {"mse": 0.0, "relative": 0.0,
+                            "relative_norm": 0.0, "cosine": 1.0,
+                            "n_anchors": 0}
             alignment = identity_alignment(dim, version, new_version)
-        align_sec = time.time() - ta
+            align_sec = time.time() - ta
+        else:
+            raw_old = encode_mu(prev_encoder, anchors_img, device=device)
+            raw_new = encode_mu(vae.encoder, anchors_img, device=device)
+            z_old = raw_old.flatten(1)
+            z_new = raw_new.flatten(1)
+            n_old = protocol.normalize(raw_old)
+            n_new = protocol.normalize(raw_new)
+            anchor_drift = {
+                "mse": float((z_new - z_old).pow(2).mean()),
+                "relative": float((z_new - z_old).pow(2).mean() /
+                                  z_new.pow(2).mean().clamp_min(1e-8)),
+                "relative_norm": float((n_new - n_old).pow(2).mean() /
+                                       n_new.pow(2).mean().clamp_min(1e-8)),
+                "cosine": float(torch.nn.functional.cosine_similarity(
+                    z_old, z_new, dim=1).mean()),
+                "n_anchors": int(n_a)}
+            if do_update and align_mode == "diagonal_affine":
+                alignment = estimate_feature_alignment(
+                    prev_encoder, vae.encoder, anchors_img, anchors_y,
+                    version_from=version, version_to=new_version,
+                    max_scale=float(cfg["alignment"].get("max_scale", 3.0)),
+                    method="diagonal_affine", device=device, protocol=protocol)
+            else:
+                alignment = identity_alignment(dim, version, new_version)
+            align_sec = time.time() - ta
 
         # ---------------- 当前轮特征 ----------------
         te = time.time()
         cur_raw = encode_mu(vae.encoder, current.images, device=device)
         cur_feats = protocol.normalize(cur_raw)
+        # DM 精确目标 / history_mode=replay / 旧 reencode 模式都需要用当前
+        # encoder 重编码历史 replay，保证目标集合与代表特征处于同一版本
+        need_rep_now = dm_exact or history_mode == "replay" or (
+            do_update and align_mode == "reencode")
         rep_feats_reenc = None
-        if vae_update and align_mode == "reencode" and len(rep_imgs) > 0:
+        if need_rep_now and len(rep_imgs) > 0:
             rep_feats_reenc = protocol.normalize(
                 encode_mu(vae.encoder, rep_imgs, device=device))
         encode_sec = time.time() - te
 
         # ---------------- 统计记忆 ----------------
         ts = time.time()
-        if not vae_update:
+        if not do_update:
             stats.update(cur_feats, current.labels, version, round_idx=t)
         elif align_mode == "diagonal_affine":
             stats.align_to(new_version, alignment)
@@ -560,9 +624,22 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             all_y = torch.cat([rep_labels, current.labels], 0) \
                 if rep_feats_reenc is not None else current.labels
             stats.update(all_f, all_y, new_version, round_idx=t)
+            stats_origin = "replay_plus_current"
         else:  # none: 跨版本直接混用是禁止的，只能丢弃历史统计
             stats.reset(new_version)
             stats.update(cur_feats, current.labels, new_version, round_idx=t)
+            stats_origin = "current_only"
+        if history_mode == "replay" and not (do_update and
+                                             align_mode == "reencode"):
+            # 消融：与 DM / K-means 相同的固定历史预算（replay + current），
+            # 而非累计全部历史样本
+            stats.reset(new_version)
+            all_f = torch.cat([rep_feats_reenc, cur_feats], 0) \
+                if rep_feats_reenc is not None else cur_feats
+            all_y = torch.cat([rep_labels, current.labels], 0) \
+                if rep_feats_reenc is not None else current.labels
+            stats.update(all_f, all_y, new_version, round_idx=t)
+            stats_origin = "replay_plus_current"
         stats_sec = time.time() - ts
 
         # ---------------- 代表集更新 ----------------
@@ -575,49 +652,55 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         #   10%  更新 + 10%  上传 -> 更新/上传同一子集，严格一致
         if update_fraction >= 1.0:
             opt_idx = None
-        elif patch_idx is not None:
-            opt_idx = patch_idx
         else:
+            # 优化子集与上传子集相互独立：比例不同时必须各自抽样
             opt_idx = select_patch_indices(memory.quotas, update_fraction, t)
         updated_idx = np.arange(budget) if opt_idx is None else opt_idx
         td = time.time()
-        if vae_update and align_mode == "reencode":
+        if do_update and align_mode == "reencode":
             all_f = torch.cat([rep_feats_reenc, cur_feats], 0) \
                 if rep_feats_reenc is not None else cur_feats
             all_y = torch.cat([rep_labels, current.labels], 0) \
                 if rep_feats_reenc is not None else current.labels
+            init_method = cfg["memory"].get("representative_init", "kmeans")
             memory.reinitialize_from_features(
                 all_f, all_y,
-                method=cfg["memory"].get("representative_init", "kmeans"),
+                method=init_method,
                 version=new_version, round_idx=t, seed=int(seed),
                 device=device, cfg=cfg["distillation"])
             if distill == "dm":
                 sdm = StreamingDM(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
-                out = sdm.update(stats, allowed_idx=opt_idx, round_idx=t)
+                out = sdm.update(allowed_idx=opt_idx, round_idx=t,
+                                 real_features=all_f, real_labels=all_y)
                 memory.features = out["features"]
-                distill_info = {**out["info"], "init": "reencode_kmeans"}
-            elif distill == "reinit":
-                distill_info = {"method": "reinit",
-                                "init": cfg["memory"].get(
-                                    "representative_init", "kmeans"),
-                                "n_optimized": int(len(updated_idx))}
+                distill_info = {**out["info"],
+                                "init": f"reencode_{init_method}",
+                                "target_scope": "replay_plus_current",
+                                "n_target": int(len(all_y))}
             else:
                 distill_info = {"method": "reencode"}
         else:
-            if distill == "reinit":
-                raise ValueError("reinit 方法只用于 alignment.method=reencode")
             if new_version > version:
                 memory.align(alignment)
             if distill == "dm":
+                if rep_feats_reenc is not None:
+                    real_f = torch.cat([rep_feats_reenc, cur_feats], 0)
+                    real_y = torch.cat([rep_labels, current.labels], 0)
+                    target_scope = "replay_plus_current"
+                else:
+                    real_f, real_y = cur_feats, current.labels
+                    target_scope = "current_only"
                 sdm = StreamingDM(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
-                out = sdm.update(stats, allowed_idx=opt_idx, round_idx=t)
+                out = sdm.update(allowed_idx=opt_idx, round_idx=t,
+                                 real_features=real_f, real_labels=real_y)
                 memory.features = out["features"]
-                distill_info = out["info"]
-            elif distill in ("kmeans", "herding", "reservoir"):
+                distill_info = {**out["info"], "target_scope": target_scope,
+                                "n_target": int(len(real_y))}
+            elif distill == "kmeans":
                 if new_version > version:
                     coreset.align(alignment)
                 res = coreset.update(cur_feats, current.labels, round_idx=t,
@@ -640,7 +723,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         # ---------------- Replay ----------------
         if replay_enabled:
-            replay.add_batch(current.images, current.labels)
+            replay.add_batch(current.images, current.labels, round_idx=t)
         replay.assert_capacity()
 
         # ---------------- 同步 ----------------
@@ -690,7 +773,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             dom_f = protocol.normalize(
                 encode_mu(vae.encoder, dom_x, device=device))
             eval_encode_sec += time.time() - te
-            dm_met = learner.evaluate(dom_f, stream.test_labels)
+            dm_met = learner.evaluate(dom_f, dom_y)
             group_metrics["current_domain"] = {"acc": dm_met["acc"],
                                                "f1": dm_met["f1"],
                                                "level": level}
@@ -713,15 +796,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             tq = q.dequantize(q.quantize(test_feats))
             test_int8 = learner.evaluate(tq, stream.test_labels)["acc"]
             int8_sec = time.time() - tq0
-        if not vae_update or align_mode == "diagonal_affine":
-            stats_scope = "aligned_full_history"
-        elif align_mode == "reencode":
-            stats_scope = "replay_plus_current"
-        else:
-            stats_scope = "current_only"
+        stats_scope = stats_origin
 
         vm = evaluate_vae(vae, stream.val_images, stream.val_labels, cfg,
-                          device=device) if vae_update else None
+                          device=device) if do_update else None
         mem_summary = memory.summary(stats)
         peak = torch.cuda.max_memory_allocated() / 1e9 \
             if device == "cuda" else 0.0
@@ -730,18 +808,21 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         rec = {
             "round": t, "encoder_version": new_version,
             "vae": vlog, "vae_sec": vae_sec,
+            "vae_updated": bool(do_update),
+            "n_vae_batch": n_update_batch,
+            "n_vae_pending": int(len(pending_vae[1])) if pending_vae else 0,
             "anchor_drift": anchor_drift,
             "alignment": alignment.meta() if align_mode != "reencode" else
             {"method": "reencode"},
             "align_sec": align_sec,
             "statistics": stats.summary(),
             "stats_scope": stats_scope,
+            "history_mode": history_mode,
             "stats_sec": stats_sec,
             "n_current": int(len(current.labels)),
             "n_cumulative_seen": int(len(base.labels) + sum(
                 len(stream.round_indices[r]) for r in range(t + 1))),
             "n_effective_stats": int(stats.n_seen),
-            "n_replay": len(replay),
             "distill": distill_info, "distill_sec": distill_sec,
             "encode_sec": encode_sec,
             "eval_encode_sec": eval_encode_sec,
@@ -769,16 +850,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         }
         rounds_log.append(rec)
 
-        ck = checkpoint_path(
-            cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v{new_version}.pt")
-        if save:
-            torch.save({"model_state_dict": vae.state_dict(),
-                        "encoder_version": new_version, "method": tag,
-                        "seed": int(seed), "round": t,
-                        "accessible_rounds": f"initial_base + rounds 0..{t}",
-                        "n_seen": int(len(base.labels) + sum(
-                            len(stream.round_indices[r]) for r in range(t + 1))),
-                        "stream": stream.summary()}, ck)
+        # 只在 Encoder 真正更新时写盘，避免轮次间用同一版本号反复覆盖
+        n_seen_so_far = int(len(base.labels) + sum(
+            len(stream.round_indices[r]) for r in range(t + 1)))
+        if save and do_update:
+            ck = checkpoint_path(
+                cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
+                     f"vae_v{new_version}.pt")
+            _save_vae_ckpt(ck, vae, new_version, tag, seed, t, n_seen_so_far,
+                           stream)
 
         if verbose:
             print(f"  r{t} v{new_version} acc {met['acc']:.2f} "
@@ -796,19 +876,56 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             learner=learner, coreset=coreset, ledger=ledger,
                             rounds_log=rounds_log, edge_sec=edge_sec,
                             peak_gpu=peak_gpu, signature=signature,
-                            wall_sec=wall_sec + (time.time() - t_start))
+                            wall_sec=wall_sec + (time.time() - t_start),
+                            pending_vae=pending_vae,
+                            pending_rounds=pending_rounds)
         if stop_after is not None and t >= int(stop_after):
             break
 
-    partial = stop_after is not None and rounds_log[-1]["round"] >= int(stop_after)
+    # 按实际完成轮次统计（stop_after / 提前 break 时不再假设跑满）
+    final_round = int(rounds_log[-1]["round"])
+    completed_rounds = final_round + 1
+    partial = completed_rounds < stream.num_rounds
+    n_seen_final = int(len(base.labels) + sum(
+        len(stream.round_indices[r]) for r in range(completed_rounds)))
+    pending_leftover = int(len(pending_vae[1])) if pending_vae else 0
+    if save:
+        # 部分运行（stop_after / 中断）不得命名为 final，避免被当成完整结果
+        ck_name = "vae_partial.pt" if partial else "vae_final.pt"
+        ck = checkpoint_path(
+            cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
+                 f"{ck_name}")
+        _save_vae_ckpt(ck, vae, version, tag, seed, final_round, n_seen_final,
+                       stream)
     accs = [r["acc"] for r in rounds_log[1:]]
     f1s = [r["f1"] for r in rounds_log[1:]]
     final = rounds_log[-1]
+    # 时间拆账：边缘计算 / 评估 / 云端训练 / 总墙钟互不混淆
+    rl = rounds_log[1:]
+    edge_vae_sec = float(sum(r.get("vae_sec", 0.0) or 0.0 for r in rl))
+    edge_encode_sec = float(sum(r.get("encode_sec", 0.0) or 0.0 for r in rl))
+    edge_align_sec = float(sum(r.get("align_sec", 0.0) or 0.0 for r in rl))
+    edge_stats_sec = float(sum(r.get("stats_sec", 0.0) or 0.0 for r in rl))
+    edge_distill_sec = float(sum(r.get("distill_sec", 0.0) or 0.0 for r in rl))
+    edge_sync_sec = float(sum((r.get("sync") or {}).get("sec", 0.0) for r in rl))
+    eval_encode_sec = float(sum(r.get("eval_encode_sec", 0.0) or 0.0 for r in rl))
+    int8_eval_sec = float(sum(r.get("test_int8_sec", 0.0) or 0.0 for r in rl))
+    base_train_sec = float(rounds_log[0].get("base_vae_log", {}).get(
+        "train_sec", 0.0))
+    edge_compute_sec = (base_train_sec + edge_vae_sec + edge_encode_sec +
+                        edge_align_sec + edge_stats_sec + edge_distill_sec +
+                        edge_sync_sec)
+    wall_total_sec = wall_sec + (time.time() - t_start)
     summary = {
         "method": tag, "seed": int(seed),
         "partial": bool(partial),
+        "completed_rounds": int(completed_rounds),
         "dataset": cfg["dataset"], "scenario": stream.scenario,
         "num_rounds": stream.num_rounds,
+        "class_quota": stream.class_quota,
+        "update_every_rounds": update_every,
+        "history_mode": history_mode,
+        "vae_steps_per_round": int(vcfg.get("steps_per_round", 0)),
         "initial_acc": rounds_log[0]["acc"],
         "final_acc": final["acc"], "final_f1": final["f1"],
         "avg_online_acc": float(np.mean(accs)) if accs else None,
@@ -822,28 +939,36 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "update_fraction": update_fraction,
         "patch_fraction": patch_fraction if sync_mode == "patch" else 1.0,
         "n_reps": budget, "dim": dim,
-        "n_train_used": int(stats.n_seen),
-        "cumulative_seen_samples": int(len(base.labels) + sum(
-            len(stream.round_indices[r]) for r in range(stream.num_rounds))),
+        # 口径区分：实际已见样本 / 统计有效样本 / Replay 样本
+        "n_train_used": int(n_seen_final),
+        "cumulative_seen_samples": int(n_seen_final),
         "effective_stats_samples": int(stats.n_seen),
         "replay_samples_final": int(len(replay)),
+        "vae_pending_leftover": int(pending_leftover),
         "stats_scope": final.get("stats_scope"),
         "vae_ckpt": ck,
         "vae_accessible": f"initial_base + rounds 0..{final['round']}",
         "base_cache_signature": base_sig,
         "raw_replay_capacity": int(cfg["memory"]["raw_replay_capacity"]),
         "replay_bytes": replay.nbytes(),
-        "edge_train_sec": edge_sec,
-        "edge_total_sec": wall_sec + (time.time() - t_start),
-        "eval_encode_sec_total": float(sum(
-            r.get("eval_encode_sec", 0.0) for r in rounds_log[1:])),
-        "int8_eval_sec_total": float(sum(
-            r.get("test_int8_sec", 0.0) for r in rounds_log[1:])),
+        "edge_base_train_sec": base_train_sec,
+        "edge_vae_update_sec": edge_vae_sec,
+        "edge_encode_sec": edge_encode_sec,
+        "edge_align_sec": edge_align_sec,
+        "edge_stats_sec": edge_stats_sec,
+        "edge_distill_sec": edge_distill_sec,
+        "edge_sync_sec": edge_sync_sec,
+        # edge_train_sec 只含 VAE 训练；edge_total_sec 为边缘侧计算总耗时
+        "edge_train_sec": base_train_sec + edge_vae_sec,
+        "edge_total_sec": edge_compute_sec,
+        "eval_encode_sec_total": eval_encode_sec,
+        "int8_eval_sec_total": int8_eval_sec,
+        "eval_total_sec": eval_encode_sec + int8_eval_sec,
         "cloud_total_sec": learner.total_train_sec,
+        "wall_total_sec": wall_total_sec,
         "peak_gpu_gb": peak_gpu,
         "stats_seen_final": int(stats.n_seen),
-        "expected_seen_final": int(len(base.labels) + sum(
-            len(stream.round_indices[r]) for r in range(stream.num_rounds))),
+        "expected_seen_final": int(n_seen_final),
         "final_alignment_err": final.get("alignment", {}).get("relative_err"),
         "final_no_align_heldout_mse": final.get("alignment", {}).get(
             "no_align_heldout_mse"),

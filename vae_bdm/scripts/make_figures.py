@@ -40,11 +40,10 @@ def main():
             have.add(key)
     main_path = os.path.join(R, f"{ds}_main_r10_summary.csv")
 
-    methods = ["random", "mean", "kmeans", "herding", "kmeans_moment",
-               "bdm_mean_var"]
-    labels = {"random": "Random", "mean": "Mean", "kmeans": "K-means",
-              "herding": "Herding", "kmeans_moment": "K-means + Moment",
-              "bdm_mean_var": "Batch DM"}
+    methods = ["random", "kmeans", "kmeans_moment", "bdm_random_feature"]
+    labels = {"random": "Random", "kmeans": "K-means",
+              "kmeans_moment": "K-means + Moment",
+              "bdm_random_feature": "Nonlinear DM"}
     plt.figure(figsize=(6.4, 4.6))
     for m in methods:
         rs = [r for r in sweep if r["method"] == m]
@@ -93,10 +92,8 @@ def main():
     if os.path.exists(main_path):
         rows = list(csv.DictReader(open(main_path)))
         rows = [r for r in rows if r["method"] in
-                ("full", "random", "mean", "kmeans", "herding", "bdm_mean_var",
-                 "bdm_mean", "bdm_full", "bdm_anchor", "bdm_diversity",
-                 "bdm_cov", "bdm_all", "bdm_mean_var_randinit",
-                 "kmeans_moment", "random_moment")]
+                ("full", "random", "kmeans", "kmeans_moment",
+                 "bdm_random_feature")]
         names = [r["method"] for r in rows]
         acc = [float(r["acc_mean"]) for r in rows]
         err = [float(r["acc_std"]) for r in rows]
@@ -113,26 +110,6 @@ def main():
         plt.savefig(os.path.join(F, f"{ds}_main_r10.png"), dpi=200)
         plt.close()
 
-    bdm = load_json(os.path.join(R, f"{ds}_bdm_r10.json")) if os.path.exists(
-        os.path.join(R, f"{ds}_bdm_r10.json")) else None
-    if bdm:
-        for rec in bdm["rows"]:
-            if rec.get("dm_seed") != 42 or rec["method"] != "bdm_mean_var":
-                continue
-            logs = rec.get("dm_logs", [])
-            if not logs:
-                continue
-            it = [x["iter"] for x in logs]
-            vr = [x["var_ratio"] for x in logs]
-            plt.figure(figsize=(6.0, 3.8))
-            plt.plot(it, vr, lw=1.2, label="synthetic / real variance ratio")
-            plt.axhline(1.0, ls="--", c="k", lw=1)
-            plt.xlabel("iteration"); plt.ylabel("variance ratio")
-            plt.title(f"{ds.upper()} BDM: class-wise variance")
-            plt.tight_layout()
-            plt.savefig(os.path.join(F, f"{ds}_bdm_variance.png"), dpi=200)
-            plt.close()
-            break
     print(f"图已输出: {F}")
 
 

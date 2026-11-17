@@ -1,4 +1,4 @@
-"""Step 3-4: Batch DM 及统计量消融"""
+"""Step 3-4: Batch DM（原版：固定随机特征空间均值匹配）"""
 import argparse
 import csv
 import json
@@ -13,7 +13,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="cifar10.yaml")
     ap.add_argument("--ratio", type=float, default=10.0)
-    ap.add_argument("--variants", default="mean,mean_var,full,anchor,diversity,cov,all")
+    ap.add_argument("--variants", default="random_feature")
     ap.add_argument("--seeds", default="0,1,2")
     ap.add_argument("--save_seed", type=int, default=42)
     a = ap.parse_args()

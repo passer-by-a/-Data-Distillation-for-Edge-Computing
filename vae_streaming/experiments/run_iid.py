@@ -2,7 +2,7 @@
 
 python -m vae_streaming.experiments.run_iid \
     --config vae_streaming/configs/cifar100.yaml \
-    --methods online_replay_align_dm --seeds 42
+    --methods online_kmeans,online_moment,dm --seeds 42
 """
 import os
 import sys
@@ -15,4 +15,4 @@ from vae_streaming.experiments.cli import run_cli  # noqa: E402
 
 
 if __name__ == "__main__":
-    run_cli("iid", ["online_replay_align_dm"])
+    run_cli("iid", ["online_kmeans", "online_moment", "dm"])

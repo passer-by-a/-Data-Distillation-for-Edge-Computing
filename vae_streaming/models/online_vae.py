@@ -201,7 +201,11 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
                 "accessible": f"round<= {round_idx}"}
 
     vae.train()
-    opt = torch.optim.Adam(vae.parameters(), lr=float(vcfg["lr"]))
+    # 在线学习率/分类权重可与初始训练解耦：默认沿用 base 配置，
+    # 便于只调在线阶段而不触发 Initial Base VAE 缓存失效
+    online_lr = float(vcfg.get("online_lr", vcfg["lr"]))
+    online_cls = float(vcfg.get("online_cls_lambda", vcfg["cls_lambda"]))
+    opt = torch.optim.Adam(vae.parameters(), lr=online_lr)
     bs = int(vcfg["batch_size"])
     steps = int(vcfg["steps_per_round"])
     replay_ratio = float(vcfg.get("replay_ratio", 0.0)) \
@@ -235,7 +239,7 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
             x = _augment(x)
 
         loss, parts = vae_losses(vae, x, y, float(vcfg["beta"]),
-                                 float(vcfg["cls_lambda"]))
+                                 online_cls)
         stab = torch.zeros((), device=device)
         if stability:
             mu_cur = vae.encode_mu(x[-n_rep:])
@@ -255,6 +259,7 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
     row = {k: (float(torch.stack(v).double().sum()) / max(1, steps)
                if v else 0.0) for k, v in hist.items()}
     row.update({"steps": steps, "train_sec": time.time() - t0,
+                "online_lr": online_lr, "online_cls_lambda": online_cls,
                 "replay_ratio": float(n_rep / max(1, bs)),
                 "n_replay_in_batch": int(n_rep),
                 "accessible": f"round<= {round_idx}"})

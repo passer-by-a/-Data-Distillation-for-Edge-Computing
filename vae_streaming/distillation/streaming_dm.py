@@ -11,7 +11,7 @@ import time
 
 import torch
 
-from random_feature import RandomMLP
+from random_feature import MultiRandomMLP, RandomMLP, ResidualMLP
 
 
 class StreamingDM:
@@ -36,30 +36,62 @@ class StreamingDM:
         self.wd = float(self.cfg.get("weight_decay", 0.0))
         self.lm = float(self.cfg.get("lambda_mean", 1.0))
         self.la = float(self.cfg.get("lambda_anchor", 0.0))
-        self.objective = "random_feature_mean"
-        # 固定随机网络：参数不训练，只对 synthetic 特征保留梯度
-        self.feature_net = RandomMLP(
-            self.dim,
+        self.latent_w = float(self.cfg.get("lambda_latent", 0.0))
+        self.feature_type = str(self.cfg.get("feature_type", "mlp"))
+        f_kwargs = dict(
+            input_dim=self.dim,
             hidden_dim=int(self.cfg.get("feature_hidden", 2048)),
             output_dim=int(self.cfg.get("feature_out", 1024)),
-            seed=int(self.cfg.get("feature_seed", 0))).to(self.device)
+            seed=int(self.cfg.get("feature_seed", 0)))
+        # 固定随机网络：参数不训练，只对 synthetic 特征保留梯度
+        if self.feature_type == "multi_mlp":
+            self.n_mappings = int(self.cfg.get("num_mappings", 3))
+            self.feature_net = MultiRandomMLP(
+                n_mappings=self.n_mappings, **f_kwargs).to(self.device)
+        elif self.feature_type == "residual_mlp":
+            self.n_mappings = 1
+            self.feature_net = ResidualMLP(**f_kwargs).to(self.device)
+        else:
+            self.n_mappings = 1
+            self.feature_net = RandomMLP(**f_kwargs).to(self.device)
+        self.objective = {
+            "mlp": "random_feature_mean",
+            "multi_mlp": "multi_random_feature_mean",
+            "residual_mlp": "residual_feature_mean",
+        }.get(self.feature_type, "random_feature_mean")
+        if self.latent_w > 0:
+            self.objective += "+latent_mean"
 
     # ------------------------------------------------------------------
-    def _batch_loss(self, p, sel, active, anchor, real_mean):
+    def _apply_feat(self, x):
+        """统一成 [K, N, D]：单映射时 K=1"""
+        out = self.feature_net(x)
+        return out if out.dim() == 3 else out.unsqueeze(0)
+
+    # ------------------------------------------------------------------
+    def _batch_loss(self, p, sel, active, anchor, real_mean,
+                    real_latent_mean=None):
         """按类别一次性计算损失（[C,qmax,D] 批量，避免逐类 Python 循环）。
 
         p: 全部代表特征；sel: 本步参与更新的位置；active: 本轮有真实特征的类别。
         每个类别独立优化，因此对类别求和等价于逐类单独 backward。
+        real_mean: [K,C,Do] 各随机映射下的逐类真实均值。
+        real_latent_mean: [C,D] 原始潜空间的逐类真实均值（可选）。
         """
         m3 = sel.unsqueeze(-1).to(p.dtype)                # [C,qmax,1]
         q = sel.sum(1, keepdim=True).clamp_min(1).to(p.dtype)
-        feat = self.feature_net(p.reshape(-1, self.dim)).reshape(
-            p.size(0), p.size(1), -1)
-        f_mu = (feat * m3).sum(1) / q
-        l_mean_c = (f_mu - real_mean).pow(2).mean(1)
+        feat = self._apply_feat(p.reshape(-1, self.dim))   # [K,C,qmax,Do]
+        feat = feat.reshape(feat.size(0), p.size(0), p.size(1), -1)
+        f_mu = (feat * m3.unsqueeze(0)).sum(2) / q.unsqueeze(0)
+        l_mean_c = (f_mu - real_mean).pow(2).mean(dim=(0, 2))
         l_anchor_c = ((p - anchor).pow(2) * m3).sum((1, 2)) / (q[:, 0] * self.dim)
-        loss = (self.lm * l_mean_c + self.la * l_anchor_c)[active].sum()
-        return loss, l_mean_c, l_anchor_c
+        loss = self.lm * l_mean_c + self.la * l_anchor_c
+        l_latent_c = None
+        if real_latent_mean is not None:
+            p_mu = (p * m3).sum(1) / q                     # [C,D]
+            l_latent_c = (p_mu - real_latent_mean).pow(2).mean(1)
+            loss = loss + self.latent_w * l_latent_c
+        return loss[active].sum(), l_mean_c, l_anchor_c, l_latent_c
 
     # ------------------------------------------------------------------
     def update(self, allowed_idx=None, round_idx=0, verbose=False,
@@ -97,12 +129,20 @@ class StreamingDM:
 
         # ---------- 原版 DM 目标：固定随机网络下的逐类真实均值 ----------
         rl = real_labels.to(dev)
+        rf_dev = real_features.to(dev)
         with torch.no_grad():
-            rf = self.feature_net(real_features.to(dev))
-            rsum = torch.zeros(num_classes, rf.size(1), device=dev
-                               ).index_add_(0, rl, rf)
+            rf = self._apply_feat(rf_dev)                  # [K,N,Do]
+            rsum = torch.zeros(rf.size(0), num_classes, rf.size(-1),
+                               device=dev)
+            for k in range(rf.size(0)):
+                rsum[k].index_add_(0, rl, rf[k])
             rcnt = torch.bincount(rl, minlength=num_classes)
-            real_mean = rsum / rcnt.clamp_min(1)[:, None].to(dev)
+            real_mean = rsum / rcnt.clamp_min(1)[None, :, None].to(dev)
+            real_latent_mean = None
+            if self.latent_w > 0:
+                lsum = torch.zeros(num_classes, dim, device=dev)
+                lsum.index_add_(0, rl, rf_dev)
+                real_latent_mean = lsum / rcnt.clamp_min(1)[:, None].to(dev)
         has = rcnt > 0
         train = sel & has[:, None]
         hold = ~train
@@ -113,25 +153,31 @@ class StreamingDM:
         opt = torch.optim.AdamW([p], lr=self.lr, weight_decay=self.wd)
         p0 = p.detach().clone()
         n_steps = self.updates_per_class
-        acc = None
+        acc = {"mean": torch.zeros(num_classes, device=dev),
+               "anchor": torch.zeros(num_classes, device=dev),
+               "latent": torch.zeros(num_classes, device=dev)
+               if real_latent_mean is not None else None}
         for _ in range(n_steps):
-            loss, lm_c, la_c = self._batch_loss(
-                p, train, has, anchor, real_mean)
+            loss, lm_c, la_c, ll_c = self._batch_loss(
+                p, train, has, anchor, real_mean, real_latent_mean)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            parts = torch.stack([lm_c.detach(), la_c.detach()])
-            acc = parts if acc is None else acc + parts
+            acc["mean"] += lm_c.detach()
+            acc["anchor"] += la_c.detach()
+            if ll_c is not None:
+                acc["latent"] += ll_c.detach()
         with torch.no_grad():
             # 未参与更新的位置严格保持对齐后的旧值（含权重衰减影响）
             p[hold] = p0[hold]
-        acc /= max(1, n_steps)
+        for k in acc:
+            if acc[k] is not None:
+                acc[k] /= max(1, n_steps)
 
         # ---------- 写回并汇报 ----------
         with torch.no_grad():
             out = self.features.clone()
             out[slot[valid]] = p.detach()[valid_dev].cpu()
-            acc_cpu = acc.cpu()
             n_opt = train.sum(1).cpu()
             total_c = torch.tensor([b - a for a, b in
                                     (self.slices[c] for c in range(num_classes))])
@@ -139,17 +185,26 @@ class StreamingDM:
         for c in range(num_classes):
             if not bool(has[c]):
                 continue
-            lm, la = (float(acc_cpu[i, c]) for i in range(2))
-            per_class.append({"class": c,
-                              "loss": self.lm * lm + self.la * la,
-                              "mean": lm, "anchor": la,
-                              "n_optimized": int(n_opt[c]),
-                              "n_total": int(total_c[c])})
+            lm = float(acc["mean"][c].cpu())
+            la = float(acc["anchor"][c].cpu())
+            rec = {"class": c,
+                   "loss": self.lm * lm + self.la * la,
+                   "mean": lm, "anchor": la,
+                   "n_optimized": int(n_opt[c]),
+                   "n_total": int(total_c[c])}
+            if acc["latent"] is not None:
+                ll = float(acc["latent"][c].cpu())
+                rec["latent"] = ll
+                rec["loss"] += self.latent_w * ll
+            per_class.append(rec)
 
         self.features = out
         return {"features": out, "info": {
             "method": "streaming_dm", "round": int(round_idx),
             "objective": self.objective,
+            "feature_type": self.feature_type,
+            "num_mappings": int(self.n_mappings),
+            "lambda_latent": self.latent_w,
             "real_samples": int(len(real_features)),
             "per_class": per_class,
             "n_optimized": int(n_opt.sum()),

@@ -134,13 +134,26 @@ def _augment(x):
 # ======================================================================
 # 损失
 # ======================================================================
-def vae_losses(vae, x, y, beta, cls_lambda):
+def vae_losses(vae, x, y, beta, cls_lambda, n_unlabeled=0):
+    """L = L_recon + beta * L_KL + cls_lambda * L_CE(有标签部分)
+
+    n_unlabeled > 0 时，前 n_unlabeled 个样本被视为无标签流式数据：
+    重建/KL 在全体样本上计算，CE 只在剩余有标签样本上做分组均值，
+    避免把缺失的 CE 当成 0 后再整体平均而稀释分类权重。
+    """
     recon, z, logits, mu, logvar = vae(x)
     rec = F.mse_loss(recon, x)
     kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
-    ce = F.cross_entropy(logits, y)
+    n_unlabeled = max(0, int(n_unlabeled))
+    if y is None or n_unlabeled >= x.size(0):
+        ce = x.new_zeros(())
+        n_ce = 0
+    else:
+        ce = F.cross_entropy(logits[n_unlabeled:], y[n_unlabeled:])
+        n_ce = int(x.size(0) - n_unlabeled)
     loss = rec + beta * kl + cls_lambda * ce
-    return loss, {"rec": rec.detach(), "kl": kl.detach(), "ce": ce.detach()}
+    return loss, {"rec": rec.detach(), "kl": kl.detach(),
+                  "ce": ce.detach(), "n_ce": n_ce}
 
 
 # ======================================================================
@@ -174,7 +187,8 @@ def train_initial_vae(vae, images, labels, cfg, device="cuda", verbose=True):
             opt.step()
             hist["loss"].append(loss.detach())
             for k, v in parts.items():
-                hist[k].append(v.detach())
+                if k in hist:
+                    hist[k].append(v.detach())
             nb += 1
         row = {k: (float(torch.stack(v).double().sum()) / max(1, nb)
                    if v else 0.0) for k, v in hist.items()}
@@ -194,7 +208,12 @@ def train_initial_vae(vae, images, labels, cfg, device="cuda", verbose=True):
 # ======================================================================
 def online_vae_update(vae, images, labels, replay_images, replay_labels,
                       prev_encoder, cfg, device="cuda", round_idx=0):
-    """固定 optimization steps，当前数据 + replay 组成每个 batch。"""
+    """固定 optimization steps，当前数据 + replay 组成每个 batch。
+
+    labels=None 表示当前窗口是无标签流式数据（unlabeled_after_base 协议）：
+    当前数据只参与重建 + KL；CE 只作用于 replay 中的真实有标签 Base 样本，
+    且按有标签分组求均值（不随无标签/有标签比例改变有效权重）。
+    """
     vcfg = cfg["vae"]
     if not bool(vcfg.get("online_update", True)):
         return {"skipped": True, "steps": 0, "train_sec": 0.0,
@@ -222,11 +241,14 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
     # 先收集标量、结束时一次汇总，避免每 step 触发 host 同步
     hist = {k: [] for k in ("rec", "kl", "ce", "stab", "loss")}
     t0 = time.time()
+    n_seen_ce = 0
 
     for _ in range(steps):
-        ic = torch.randint(0, len(labels), (n_cur,), generator=g)
+        ic = torch.randint(0, len(images), (n_cur,), generator=g)
         xc = to_float(images[ic], device)
-        yc = labels[ic].to(device)
+        # 无标签窗口用 -1 占位；CE 只会在 [n_unlab:] 的后半段计算
+        yc = labels[ic].to(device) if labels is not None else \
+            torch.full((n_cur,), -1, dtype=torch.long, device=device)
         if n_rep > 0:
             ir = torch.randint(0, len(replay_labels), (n_rep,), generator=g)
             xr = to_float(replay_images[ir], device)
@@ -235,11 +257,14 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
             y = torch.cat([yc, yr], 0)
         else:
             x, y = xc, yc
+        # 无标签流式窗口在前，有标签 Base Replay 在后 → CE 只取后半部分
+        n_unlab = n_cur if labels is None else 0
         if vcfg.get("augment", True):
             x = _augment(x)
 
         loss, parts = vae_losses(vae, x, y, float(vcfg["beta"]),
-                                 online_cls)
+                                 online_cls, n_unlabeled=n_unlab)
+        n_seen_ce += int(parts["n_ce"])
         stab = torch.zeros((), device=device)
         if stability:
             mu_cur = vae.encode_mu(x[-n_rep:])
@@ -254,7 +279,8 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
         if stability:
             hist["stab"].append(stab.detach())
         for k, v in parts.items():
-            hist[k].append(v.detach())
+            if k in hist:
+                hist[k].append(v.detach())
 
     row = {k: (float(torch.stack(v).double().sum()) / max(1, steps)
                if v else 0.0) for k, v in hist.items()}
@@ -262,6 +288,12 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
                 "online_lr": online_lr, "online_cls_lambda": online_cls,
                 "replay_ratio": float(n_rep / max(1, bs)),
                 "n_replay_in_batch": int(n_rep),
+                "n_current_per_batch": int(n_cur),
+                "n_ce_labeled": int(n_seen_ce),
+                "ce_group": ("labeled_base_replay" if labels is None
+                             else "all"),
+                "current_labels": ("unlabeled" if labels is None
+                                   else "ground_truth"),
                 "accessible": f"round<= {round_idx}"})
     return row
 

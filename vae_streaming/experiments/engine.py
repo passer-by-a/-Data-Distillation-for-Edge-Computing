@@ -25,7 +25,7 @@ from ..communication.payload_accounting import (CommunicationLedger,
                                                 message_size,
                                                 select_patch_indices)
 from ..communication.quantization import decode_features, encode_features
-from ..data.causal_stream import CausalStream
+from ..data.causal_stream import CausalStream, regroup_stream_rounds
 from ..distillation.moment_calibration import streaming_moment_calibrate
 from ..distillation.online_coreset import OnlineKMeans, build_coreset
 from ..distillation.streaming_dm import StreamingDM
@@ -37,6 +37,7 @@ from ..models.feature_alignment import (estimate_feature_alignment,
 from ..models.online_vae import (FeatureProtocol, build_vae, encode_mu,
                                  evaluate_vae, online_vae_update,
                                  snapshot_encoder, train_initial_vae)
+from ..models.pseudo_labeler import PSEUDO_SOURCE, FixedTeacher
 from ..config_utils import checkpoint_path, result_path
 
 
@@ -95,6 +96,21 @@ for _name, _extra in {
 }.items():
     METHOD_OVERRIDES[_name] = deep_merge(
         METHOD_OVERRIDES["dm"], {"distillation": _extra})
+
+# DM 结构对照：Residual DM 沿用它自己的特征映射，但 VAE/Alignment/目标集合
+# 与 81.11% 的 Plain DM（dm_r392u10）完全一致（reencode + lr1e-3 + cls0.1）
+METHOD_OVERRIDES["dm_residual_r392base"] = deep_merge(
+    METHOD_OVERRIDES["dm_residual"],
+    {"vae": {"online_lr": 1e-3, "online_cls_lambda": 0.1},
+     "alignment": {"method": "reencode"},
+     "distillation": {"exact_target": False}})
+
+# 同一协议下的 Plain DM 配对基线（Encoder 轨迹必须与上一项逐轮相同）
+METHOD_OVERRIDES["dm_r392base"] = deep_merge(
+    METHOD_OVERRIDES["dm"],
+    {"vae": {"online_lr": 1e-3, "online_cls_lambda": 0.1},
+     "alignment": {"method": "reencode"},
+     "distillation": {"exact_target": False}})
 
 # 诊断用：冻结 Encoder（不做在线 VAE 更新），其余流程保持不变
 METHOD_OVERRIDES["dm_freeze"] = deep_merge(
@@ -163,6 +179,24 @@ def _encoder_sha1(encoder):
     return h.hexdigest()[:16]
 
 
+def _tensor_sha1(t):
+    """任意张量/参数的指纹（用于核对逐轮轨迹是否变化）"""
+    h = hashlib.sha1()
+    if t is None:
+        return "none"
+    h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def _module_sha1(module):
+    h = hashlib.sha1()
+    sd = module.state_dict()
+    for k in sorted(sd):
+        h.update(k.encode())
+        h.update(sd[k].detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
 def _stratified_anchor_indices(labels, n_a, num_classes):
     """按类别分层抽取锚点索引（Replay 按类别连续存储）。
 
@@ -216,18 +250,27 @@ def _save_vae_ckpt(path, vae, version, tag, seed, round_idx, n_seen, stream):
                 "n_seen": int(n_seen), "stream": stream.summary()}, path)
 
 
-def _build_stream(cfg):
+def _build_stream(cfg, stream=None):
+    if stream is not None:
+        return stream
     s = cfg["stream"]
-    return CausalStream(
+    # group_rounds: 先在原粒度的轮序列上构造数据，再按连续样本重新等分，
+    # 保证 base/流式数据/顺序与对照组完全一致
+    src_rounds = int(s.get("group_rounds") or s["num_rounds"])
+    stream = CausalStream(
         dataset=cfg["dataset"],
         initial_fraction=float(s["initial_fraction"]),
-        num_rounds=int(s["num_rounds"]),
+        num_rounds=src_rounds,
         seed=int(s["shuffle_seed"]),
         class_balanced_initial=bool(s.get("class_balanced_initial", True)),
         scenario=s.get("scenario", "iid"),
         val_ratio=float(cfg["val_ratio"]),
         split_seed=int(cfg["split_seed"]),
-        class_quota=s.get("class_quota"))
+        class_quota=s.get("class_quota"),
+        label_mode=s.get("label_mode", "supervised_stream"))
+    if src_rounds != int(s["num_rounds"]):
+        stream = regroup_stream_rounds(stream, int(s["num_rounds"]))
+    return stream
 
 
 def _state_signature(cfg, tag, seed):
@@ -259,8 +302,9 @@ def _base_signature(cfg, seed, stream):
         "val_ratio": float(cfg["val_ratio"]),
         "class_balanced_initial": bool(s.get("class_balanced_initial", True)),
         "class_quota": s.get("class_quota"),
-        # 配额模式下 base 大小依赖轮数
-        "class_quota_rounds": int(s["num_rounds"]) if s.get("class_quota") else None,
+        # 配额模式下 base 大小依赖"构造流式数据时的轮数"（而非重分组后的轮数）
+        "class_quota_rounds": (int(s.get("group_rounds") or s["num_rounds"])
+                               if s.get("class_quota") else None),
         # 直接校验 base 样本索引本身，避免数据划分实现变化后误用旧缓存
         "base_indices_sha1": hashlib.sha1(base_idx.tobytes()).hexdigest()[:16],
         "n_base": int(len(base_idx)),
@@ -275,9 +319,12 @@ def _base_signature(cfg, seed, stream):
 def _save_run_state(path, *, vae, version, last_round, protocol, memory,
                     statistics, replay, cloud, learner, coreset, ledger,
                     rounds_log, edge_sec, peak_gpu, signature, wall_sec=0.0,
-                    pending_vae=None, pending_rounds=None, reservoir=None):
+                    pending_vae=None, pending_rounds=None, reservoir=None,
+                    teacher=None):
     torch.save({
         "signature": signature, "vae": vae.state_dict(),
+        "teacher": teacher.state_dict() if teacher is not None else None,
+        "teacher_version": int(teacher.version) if teacher is not None else 0,
         "version": int(version), "last_round": int(last_round),
         "pending_vae": pending_vae,
         "pending_rounds": list(pending_rounds or []),
@@ -301,7 +348,7 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
 
 
 def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
-               stop_after=None):
+               stop_after=None, stream=None):
     if method is not None and method not in METHOD_OVERRIDES:
         raise ValueError(f"未知方法 {method}; 可选: {sorted(METHOD_OVERRIDES)}")
     if method is not None:
@@ -349,12 +396,29 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     history_mode = str(cfg["stream"].get("history_mode", "full"))
     if history_mode not in ("full", "replay"):
         raise ValueError(f"history_mode 只能是 full / replay，实际 {history_mode}")
+    # ---------------- 标签协议 ----------------
+    label_mode = str(cfg["stream"].get("label_mode", "supervised_stream"))
+    if label_mode not in ("supervised_stream", "unlabeled_after_base"):
+        raise ValueError(f"未知标签协议: {label_mode}")
+    unlabeled = label_mode == "unlabeled_after_base"
+    pl_cfg = cfg.get("pseudo_labels", {}) or {}
+    pseudo_threshold = float(pl_cfg.get("threshold", 0.9))
+    if unlabeled:
+        if align_mode not in ("diagonal_affine", "none"):
+            raise ValueError(
+                "unlabeled_after_base 只支持 diagonal_affine / none 对齐")
+        if distill == "dm" and not bool(
+                cfg["distillation"].get("exact_target", False)):
+            raise ValueError(
+                "无标签 DM 的匹配目标必须包含 Base Replay 的真实特征，"
+                "请设置 distillation.exact_target=True")
+    select_best_on_val = bool(cfg["cloud"].get("select_best_on_val", True))
     # DM 精确目标：每轮都用当前 encoder 重编码 replay+current 作为同一目标集合
     dm_exact = distill == "dm" and bool(
         cfg["distillation"].get("exact_target", False))
     signature = _state_signature(cfg, tag, seed)
 
-    stream = _build_stream(cfg)
+    stream = _build_stream(cfg, stream)
     base_sig = _base_signature(cfg, seed, stream)
     ckpt0 = checkpoint_path(
         cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt")
@@ -408,6 +472,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                         "seed": int(seed),
                         "accessible": "initial_base_only"}, base_ckpt)
     vae.eval()
+
+    # 固定 Teacher：Initial Base VAE 的完整快照，之后不再更新
+    teacher = FixedTeacher(vae, version=0)
+    if resuming:
+        if st.get("teacher") is not None:
+            teacher.module.load_state_dict(st["teacher"])
+            teacher.version = int(st.get("teacher_version", 0))
+        elif unlabeled:
+            raise ValueError("无标签协议断点缺少固定 Teacher 快照")
 
     quotas = allocate_quotas(base.labels.numpy(), budget, C)
     peak_gpu = 0.0
@@ -524,11 +597,13 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                            int(len(base.labels)), stream)
 
         val_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.val_images, device=device))
+            encode_mu(vae.encoder, stream.val_images, device=device)) \
+            if select_best_on_val else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
         cloud_init = learner.update(cloud.features, cloud.labels, val_feats,
-                                    stream.val_labels, round_idx=-1,
+                                    stream.val_labels if select_best_on_val
+                                    else None, round_idx=-1,
                                     mode=cloud_mode)
         init_metrics = learner.evaluate(test_feats, stream.test_labels)
         if device == "cuda":
@@ -539,11 +614,18 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "base_vae_log": base_log,
             "feat_norm_protocol": protocol.meta(),
             "memory": memory.summary(stats),
+            "memory_sha1": _tensor_sha1(memory.features),
             "statistics": stats.summary(),
             "cloud": cloud_init,
+            "cloud_param_sha1": _module_sha1(learner.model),
             "acc": init_metrics["acc"], "f1": init_metrics["f1"],
             "sync_bytes": size,
             "sync_verify": init_verify,
+            "label_mode": label_mode,
+            "pseudo_threshold": pseudo_threshold if unlabeled else None,
+            "teacher_fingerprint": teacher.fingerprint(),
+            "stream_sha1": stream.stream_indices_sha1(),
+            "encoder_sha1": _encoder_sha1(vae.encoder),
         }
         rounds_log = [initial_record]
         edge_sec = base_log["train_sec"]
@@ -564,7 +646,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             signature=signature,
                             wall_sec=wall_sec + (time.time() - t_start),
                             pending_rounds=pending_rounds,
-                            reservoir=reservoir)
+                            reservoir=reservoir, teacher=teacher)
 
     # 统计来源（跨轮保持）：只有真正发生 reset 才降级，不因当前轮未更新而误标
     stats_origin = "aligned_full_history"
@@ -577,16 +659,33 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         tr = time.time()
         current = stream.round(t)
         prev_encoder = snapshot_encoder(vae, version)
+        # 无标签协议：只在当前轮生成一次伪标签，四种方法共享同一结果
+        cur_labels = None
+        pseudo = None
+        if unlabeled:
+            pseudo = teacher.make_batch(current, threshold=pseudo_threshold,
+                                        device=device)
+            sealed = stream.train_labels[
+                torch.from_numpy(pseudo.sample_ids)]
+            if not bool((sealed == -1).all()):
+                raise RuntimeError(
+                    "流式真实标签未被密封：存在标签泄漏风险")
+        else:
+            cur_labels = getattr(current, "labels", None)
+            if cur_labels is None:
+                raise RuntimeError("监督协议下每轮必须携带真实标签")
 
         # 累积本轮样本；每 update_every 轮做一次在线更新。
         # 末轮强制 flush：392 轮下余数轮（2 轮）的样本也必须进入一次更新，
         # 否则这部分数据不参与任何 VAE 梯度（batch 会小于常规更新）。
         if vae_update:
             if pending_vae is None:
-                pending_vae = (current.images.clone(), current.labels.clone())
+                pending_vae = (current.images.clone(),
+                               None if unlabeled else cur_labels.clone())
             else:
                 pending_vae = (torch.cat([pending_vae[0], current.images], 0),
-                               torch.cat([pending_vae[1], current.labels], 0))
+                               None if unlabeled else
+                               torch.cat([pending_vae[1], cur_labels], 0))
             pending_rounds.append(int(t))
         final_flush = bool(vae_update and (t + 1) % update_every != 0
                            and t == stream.num_rounds - 1)
@@ -594,7 +693,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         # ---------------- Online VAE ----------------
         vae_sec = 0.0
-        n_update_batch = int(len(pending_vae[1])) \
+        n_update_batch = int(len(pending_vae[0])) \
             if (do_update and pending_vae is not None) else 0
         vlog = {"skipped": True, "update_every_rounds": update_every}
         rep_imgs, rep_labels = replay.get()   # DM / 锚点：允许含当前窗口
@@ -635,7 +734,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # ---------------- Anchors / Drift / Alignment ----------------
         anchors_img, anchors_y = replay.get()
         if len(anchors_img) == 0:
-            anchors_img, anchors_y = current.images, current.labels
+            anchors_img = current.images
+            anchors_y = pseudo.pseudo_labels if unlabeled else cur_labels
         n_a = min(anchor_count, len(anchors_img))
         # 类别分层抽样，保证每个有样本的类别都被锚点覆盖
         sel = _stratified_anchor_indices(anchors_y, n_a, C)
@@ -678,6 +778,20 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         te = time.time()
         cur_raw = encode_mu(vae.encoder, current.images, device=device)
         cur_feats = protocol.normalize(cur_raw)
+        # 类别条件目标（统计 / K-means / DM / Reservoir 共用）：
+        #   监督协议  → 全部当前真实标签
+        #   无标签协议 → 仅高置信度伪标签样本；低置信样本只参与 VAE 无监督训练
+        if unlabeled:
+            acc = pseudo.accept
+            cur_cls_f = cur_feats[acc]
+            cur_cls_y = pseudo.pseudo_labels[acc]
+            cur_cls_src = torch.ones(int(acc.sum()), dtype=torch.long)
+            label_source = PSEUDO_SOURCE
+        else:
+            cur_cls_f, cur_cls_y = cur_feats, cur_labels
+            cur_cls_src = torch.zeros(int(len(cur_labels)), dtype=torch.long)
+            label_source = "ground_truth"
+        n_cur_cls = int(len(cur_cls_y))
         # DM 精确目标 / history_mode=replay / 旧 reencode 模式都需要用当前
         # encoder 重编码历史 replay，保证目标集合与代表特征处于同一版本
         need_rep_now = dm_exact or history_mode == "replay" or (
@@ -691,32 +805,43 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # ---------------- 统计记忆 ----------------
         ts = time.time()
         if not do_update:
-            stats.update(cur_feats, current.labels, version, round_idx=t)
+            if n_cur_cls > 0:
+                stats.update(cur_cls_f, cur_cls_y, version, round_idx=t,
+                             label_source=label_source)
         elif align_mode == "diagonal_affine":
             stats.align_to(new_version, alignment)
-            stats.update(cur_feats, current.labels, new_version, round_idx=t)
+            if n_cur_cls > 0:
+                stats.update(cur_cls_f, cur_cls_y, new_version, round_idx=t,
+                             label_source=label_source)
         elif align_mode == "reencode":
             stats.reset(new_version)
-            all_f = torch.cat([rep_feats_reenc, cur_feats], 0) \
-                if rep_feats_reenc is not None else cur_feats
-            all_y = torch.cat([rep_labels, current.labels], 0) \
-                if rep_feats_reenc is not None else current.labels
-            stats.update(all_f, all_y, new_version, round_idx=t)
+            all_f = torch.cat([rep_feats_reenc, cur_cls_f], 0) \
+                if rep_feats_reenc is not None else cur_cls_f
+            all_y = torch.cat([rep_labels, cur_cls_y], 0) \
+                if rep_feats_reenc is not None else cur_cls_y
+            stats.update(all_f, all_y, new_version, round_idx=t,
+                         label_source=label_source)
             stats_origin = "replay_plus_current"
         else:  # none: 跨版本直接混用是禁止的，只能丢弃历史统计
             stats.reset(new_version)
-            stats.update(cur_feats, current.labels, new_version, round_idx=t)
+            if n_cur_cls > 0:
+                stats.update(cur_cls_f, cur_cls_y, new_version, round_idx=t,
+                             label_source=label_source)
             stats_origin = "current_only"
         if history_mode == "replay" and not (do_update and
                                              align_mode == "reencode"):
             # 消融：与 DM / K-means 相同的固定历史预算（replay + current），
             # 而非累计全部历史样本
             stats.reset(new_version)
-            all_f = torch.cat([rep_feats_reenc, cur_feats], 0) \
-                if rep_feats_reenc is not None else cur_feats
-            all_y = torch.cat([rep_labels, current.labels], 0) \
-                if rep_feats_reenc is not None else current.labels
-            stats.update(all_f, all_y, new_version, round_idx=t)
+            all_f = torch.cat([rep_feats_reenc, cur_cls_f], 0) \
+                if rep_feats_reenc is not None else cur_cls_f
+            all_y = torch.cat([rep_labels, cur_cls_y], 0) \
+                if rep_feats_reenc is not None else cur_cls_y
+            mixed_src = (f"mixed_base_ground_truth+{label_source}"
+                         if unlabeled and rep_feats_reenc is not None
+                         else label_source)
+            stats.update(all_f, all_y, new_version, round_idx=t,
+                         label_source=mixed_src)
             stats_origin = "replay_plus_current"
         stats_sec = time.time() - ts
 
@@ -736,10 +861,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         updated_idx = np.arange(budget) if opt_idx is None else opt_idx
         td = time.time()
         if do_update and align_mode == "reencode":
-            all_f = torch.cat([rep_feats_reenc, cur_feats], 0) \
-                if rep_feats_reenc is not None else cur_feats
-            all_y = torch.cat([rep_labels, current.labels], 0) \
-                if rep_feats_reenc is not None else current.labels
+            all_f = torch.cat([rep_feats_reenc, cur_cls_f], 0) \
+                if rep_feats_reenc is not None else cur_cls_f
+            all_y = torch.cat([rep_labels, cur_cls_y], 0) \
+                if rep_feats_reenc is not None else cur_cls_y
             init_method = cfg["memory"].get("representative_init", "kmeans")
             memory.reinitialize_from_features(
                 all_f, all_y,
@@ -764,27 +889,41 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 memory.align(alignment)
             if distill == "dm":
                 if rep_feats_reenc is not None:
-                    real_f = torch.cat([rep_feats_reenc, cur_feats], 0)
-                    real_y = torch.cat([rep_labels, current.labels], 0)
-                    target_scope = "replay_plus_current"
+                    real_f = torch.cat([rep_feats_reenc, cur_cls_f], 0)
+                    real_y = torch.cat([rep_labels, cur_cls_y], 0)
+                    real_src = torch.cat(
+                        [torch.zeros(len(rep_labels), dtype=torch.long),
+                         cur_cls_src], 0)
+                    target_scope = ("base_replay_plus_pseudo" if unlabeled
+                                    else "replay_plus_current")
                 else:
-                    real_f, real_y = cur_feats, current.labels
+                    real_f, real_y = cur_cls_f, cur_cls_y
+                    real_src = cur_cls_src
                     target_scope = "current_only"
                 sdm = StreamingDM(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
                 out = sdm.update(allowed_idx=opt_idx, round_idx=t,
-                                 real_features=real_f, real_labels=real_y)
+                                 real_features=real_f, real_labels=real_y,
+                                 real_sources=real_src,
+                                 label_source=label_source)
                 memory.features = out["features"]
                 distill_info = {**out["info"], "target_scope": target_scope,
                                 "n_target": int(len(real_y))}
             elif distill == "kmeans":
                 if new_version > version:
                     coreset.align(alignment)
-                res = coreset.update(cur_feats, current.labels, round_idx=t,
-                                     allowed_idx=opt_idx)
-                memory.features = res["features"].clone()
-                distill_info = res["info"]
+                if n_cur_cls > 0:
+                    res = coreset.update(cur_cls_f, cur_cls_y, round_idx=t,
+                                         allowed_idx=opt_idx)
+                    memory.features = res["features"].clone()
+                    distill_info = {**res["info"],
+                                    "label_source": label_source}
+                else:
+                    memory.features = memory.features.clone()
+                    distill_info = {"method": "kmeans",
+                                    "skipped": "no_accepted_pseudo",
+                                    "label_source": label_source}
             elif distill == "moment":
                 feats, minfo = streaming_moment_calibrate(
                     memory.features, memory.labels, stats,
@@ -793,19 +932,35 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 memory.features = feats
                 distill_info = minfo
             elif distill == "reservoir":
-                reservoir.add_batch(current.images, current.labels,
-                                    round_idx=t)
+                if unlabeled:
+                    if n_cur_cls > 0:
+                        reservoir.add_batch(
+                            pseudo.images[pseudo.accept], cur_cls_y,
+                            round_idx=t, source="stream",
+                            label_source=PSEUDO_SOURCE)
+                else:
+                    reservoir.add_batch(current.images, cur_labels,
+                                        round_idx=t)
                 r_imgs, r_labels = reservoir.get()
                 if len(r_labels) != budget:
                     raise RuntimeError(
                         f"Reservoir 内容不足: {len(r_labels)} < {budget}")
+                # 流式样本按伪标签入桶：类别位置必须与代表特征标签一致
+                if unlabeled and not torch.equal(r_labels,
+                                                 memory.labels.cpu()):
+                    raise RuntimeError(
+                        "Reservoir 类别位置与代表特征标签不一致")
                 # 用当前 Encoder 精确重编码缓冲内容：无质心/无梯度优化
                 memory.features = protocol.normalize(
                     encode_mu(vae.encoder, r_imgs, device=device)).clone()
                 distill_info = {"method": "reservoir",
                                 "n_buffer": int(len(r_labels)),
                                 "per_class": reservoir.per_class_counts(),
-                                "target_scope": "reservoir_exact"}
+                                "target_scope": "reservoir_exact",
+                                "balanced_by": ("pseudo" if unlabeled
+                                                else "ground_truth"),
+                                "label_source": label_source,
+                                "provenance": reservoir.provenance()}
             else:
                 raise ValueError(f"未知蒸馏方法: {distill}")
             memory.update_features(updated_idx, memory.features[updated_idx],
@@ -814,8 +969,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         edge_sec += distill_sec + encode_sec + align_sec + stats_sec
 
         # ---------------- Replay ----------------
-        if replay_enabled:
-            replay.add_batch(current.images, current.labels, round_idx=t)
+        # 无标签协议：Replay 只保存 Initial Base 的真实有标签样本，
+        # 流式图像只保留在 pending 窗口（不写入 Replay，不扩预算）
+        if replay_enabled and not unlabeled:
+            replay.add_batch(current.images, cur_labels, round_idx=t)
         replay.assert_capacity()
 
         # ---------------- 同步 ----------------
@@ -846,13 +1003,16 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         # ---------------- 云端训练与评估 ----------------
         te = time.time()
+        # 无标签协议关闭基于独立验证集的逐轮模型选择，只做固定步数训练
         val_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.val_images, device=device))
+            encode_mu(vae.encoder, stream.val_images, device=device)) \
+            if select_best_on_val else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
         eval_encode_sec = time.time() - te
         cloud_info = learner.update(cloud.features, cloud.labels, val_feats,
-                                    stream.val_labels, round_idx=t,
+                                    stream.val_labels if select_best_on_val
+                                    else None, round_idx=t,
                                     mode=cloud_mode)
         met = learner.evaluate(test_feats, stream.test_labels)
 
@@ -902,7 +1062,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "vae": vlog, "vae_sec": vae_sec,
             "vae_updated": bool(do_update),
             "n_vae_batch": n_update_batch,
-            "n_vae_pending": int(len(pending_vae[1])) if pending_vae else 0,
+            "n_vae_pending": int(len(pending_vae[0])) if pending_vae else 0,
+            "n_vae_pending_labeled": int(len(pending_vae[1]))
+            if (pending_vae and pending_vae[1] is not None) else 0,
             "anchor_drift": anchor_drift,
             "alignment": alignment.meta() if align_mode != "reencode" else
             {"method": "reencode"},
@@ -911,7 +1073,28 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "stats_scope": stats_scope,
             "history_mode": history_mode,
             "stats_sec": stats_sec,
-            "n_current": int(len(current.labels)),
+            "n_current": int(len(current)),
+            "n_class_targets": n_cur_cls,
+            "label_protocol": label_mode,
+            "pseudo": ({"label_source": PSEUDO_SOURCE,
+                        "teacher_version": int(pseudo.teacher_version),
+                        "threshold": pseudo_threshold,
+                        "n_current": int(len(pseudo)),
+                        "n_accepted": int(pseudo.n_accepted),
+                        "accept_rate": float(pseudo.n_accepted /
+                                             max(1, len(pseudo))),
+                        "class_counts": pseudo.class_counts(C),
+                        "class_confidence_mean": [
+                            float(pseudo.confidence[
+                                (pseudo.pseudo_labels == c) &
+                                pseudo.accept].mean()) if int(
+                                ((pseudo.pseudo_labels == c) &
+                                 pseudo.accept).sum()) else None
+                            for c in range(C)]}
+                       if unlabeled else None),
+            "encoder_sha1": _encoder_sha1(vae.encoder),
+            "memory_sha1": _tensor_sha1(memory.features),
+            "cloud_param_sha1": _module_sha1(learner.model),
             "n_cumulative_seen": int(len(base.labels) + sum(
                 len(stream.round_indices[r]) for r in range(t + 1))),
             "n_effective_stats": int(stats.n_seen),
@@ -971,7 +1154,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             wall_sec=wall_sec + (time.time() - t_start),
                             pending_vae=pending_vae,
                             pending_rounds=pending_rounds,
-                            reservoir=reservoir)
+                            reservoir=reservoir, teacher=teacher)
         if stop_after is not None and t >= int(stop_after):
             break
 
@@ -981,7 +1164,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     partial = completed_rounds < stream.num_rounds
     n_seen_final = int(len(base.labels) + sum(
         len(stream.round_indices[r]) for r in range(completed_rounds)))
-    pending_leftover = int(len(pending_vae[1])) if pending_vae else 0
+    pending_leftover = int(len(pending_vae[0])) if pending_vae else 0
     if save:
         # 部分运行（stop_after / 中断）不得命名为 final，避免被当成完整结果
         ck_name = "vae_partial.pt" if partial else "vae_final.pt"
@@ -1032,6 +1215,33 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "update_fraction": update_fraction,
         "patch_fraction": patch_fraction if sync_mode == "patch" else 1.0,
         "n_reps": budget, "dim": dim,
+        # ---------------- 无标签协议审计 ----------------
+        "label_mode": label_mode,
+        "pseudo_threshold": pseudo_threshold if unlabeled else None,
+        "teacher_fingerprint": teacher.fingerprint(),
+        "teacher_version": int(teacher.version),
+        "teacher_label_source": (PSEUDO_SOURCE if unlabeled else None),
+        "stream_sha1": stream.stream_indices_sha1(),
+        "base_indices_sha1": stream.base_indices_sha1(),
+        "n_vae_updates": int(sum(1 for r in rl if r.get("vae_updated"))),
+        "vae_optimizer_steps": int(sum(
+            int((r.get("vae") or {}).get("steps", 0) or 0) for r in rl)),
+        "n_distill_updates": int(sum(1 for r in rl
+                                     if float(r.get("distill_sec", 0) or 0) > 0)),
+        "n_reps_final": int(len(memory.features)),
+        "replay_provenance": replay.provenance(),
+        "pseudo_summary": ({
+            "rounds": int(sum(1 for r in rl if r.get("pseudo"))),
+            "n_accepted_total": int(sum(
+                (r.get("pseudo") or {}).get("n_accepted", 0) for r in rl)),
+            "mean_accept_rate": float(np.mean([
+                r["pseudo"]["accept_rate"] for r in rl if r.get("pseudo")]))
+            if any(r.get("pseudo") for r in rl) else None,
+            "class_counts_total": np.sum(
+                [r["pseudo"]["class_counts"] for r in rl
+                 if r.get("pseudo")], axis=0).tolist()
+            if any(r.get("pseudo") for r in rl) else None,
+        } if unlabeled else None),
         # 口径区分：实际已见样本 / 统计有效样本 / Replay 样本
         "n_train_used": int(n_seen_final),
         "cumulative_seen_samples": int(n_seen_final),

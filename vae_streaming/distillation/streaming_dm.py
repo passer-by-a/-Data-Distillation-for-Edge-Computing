@@ -95,14 +95,28 @@ class StreamingDM:
 
     # ------------------------------------------------------------------
     def update(self, allowed_idx=None, round_idx=0, verbose=False,
-               real_features=None, real_labels=None):
-        """原版 DM：目标为当前版本真实特征经固定随机网络后的逐类均值。"""
+               real_features=None, real_labels=None, real_sources=None,
+               label_source="ground_truth"):
+        """原版 DM：目标为当前版本真实特征经固定随机网络后的逐类均值。
+
+        real_sources: 与 real_features 等长的来源标记（0=Initial Base 真实
+        有标签样本，1=Initial Base Teacher 伪标签样本），用于逐类记录来源
+        占比；缺省视为全部真实标签样本（监督协议）。
+        label_source: 伪标签来源标识（unlabeled_after_base 协议下为
+        "initial_teacher_pseudo"）。
+        """
         if real_features is None or real_labels is None:
             raise ValueError("StreamingDM 必须提供 real_features/real_labels")
         real_features = torch.as_tensor(real_features).float().cpu()
         real_labels = torch.as_tensor(real_labels).long().cpu()
         if len(real_features) != len(real_labels):
             raise ValueError("real_features 与 real_labels 长度不一致")
+        if real_sources is None:
+            real_sources = torch.zeros(len(real_features), dtype=torch.long)
+        else:
+            real_sources = torch.as_tensor(real_sources).long().cpu()
+            if len(real_sources) != len(real_features):
+                raise ValueError("real_sources 与 real_features 长度不一致")
         t0 = time.time()
         num_classes, dim = self.num_classes, self.dim
         qmax = max(self.quotas)
@@ -143,6 +157,10 @@ class StreamingDM:
                 lsum = torch.zeros(num_classes, dim, device=dev)
                 lsum.index_add_(0, rl, rf_dev)
                 real_latent_mean = lsum / rcnt.clamp_min(1)[:, None].to(dev)
+        # 目标来源构成（逐类）：真实 Base Replay vs 高置信伪标签
+        src = real_sources.to(dev)
+        n_base_c = torch.bincount(rl[src == 0], minlength=num_classes)
+        n_pseudo_c = torch.bincount(rl[src == 1], minlength=num_classes)
         has = rcnt > 0
         train = sel & has[:, None]
         hold = ~train
@@ -187,11 +205,17 @@ class StreamingDM:
                 continue
             lm = float(acc["mean"][c].cpu())
             la = float(acc["anchor"][c].cpu())
+            nb, npd = int(n_base_c[c]), int(n_pseudo_c[c])
             rec = {"class": c,
                    "loss": self.lm * lm + self.la * la,
                    "mean": lm, "anchor": la,
                    "n_optimized": int(n_opt[c]),
-                   "n_total": int(total_c[c])}
+                   "n_total": int(total_c[c]),
+                   "n_base_replay": nb,
+                   "n_pseudo": npd,
+                   "pseudo_fraction": float(npd / max(1, nb + npd)),
+                   "target_mode": ("base_replay_plus_pseudo" if npd > 0
+                                   else "base_replay_only_fallback")}
             if acc["latent"] is not None:
                 ll = float(acc["latent"][c].cpu())
                 rec["latent"] = ll
@@ -206,6 +230,9 @@ class StreamingDM:
             "num_mappings": int(self.n_mappings),
             "lambda_latent": self.latent_w,
             "real_samples": int(len(real_features)),
+            "label_source": label_source,
+            "n_base_samples": int((real_sources == 0).sum()),
+            "n_pseudo_samples": int((real_sources == 1).sum()),
             "per_class": per_class,
             "n_optimized": int(n_opt.sum()),
             "mean_loss": float(sum(x["loss"] for x in per_class) /

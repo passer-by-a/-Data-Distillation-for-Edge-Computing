@@ -1,5 +1,5 @@
 # ===== 数据、模型权重、日志、结果与图（均不入库）=====
-data/
+/data/
 pt/
 checkpoints/
 logs/

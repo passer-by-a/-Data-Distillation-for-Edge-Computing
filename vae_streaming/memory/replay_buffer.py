@@ -26,20 +26,35 @@ class ClassBalancedReservoir:
         self.seen = np.zeros(num_classes, dtype=np.int64)
         self.total_added = 0
         self.total_replaced = 0
+        # 来源审计：base=Initial Base 真实标签；stream=流式样本（仅允许伪标签）
+        self.sources = {"base": 0, "stream": 0}
+        self.label_sources = {"ground_truth": 0, "initial_teacher_pseudo": 0}
 
     # ------------------------------------------------------------------
     def _bucket(self, c):
         return c if self.class_balanced else 0
 
-    def add_batch(self, images, labels, round_idx=-1):
+    def add_batch(self, images, labels, round_idx=-1, source="base",
+                  label_source="ground_truth"):
         """images: uint8 [n,3,32,32]（CPU）；labels: long [n]
 
         同时记录样本所属轮次，供 `get(exclude_rounds=...)` 排除仍留在
         VAE pending 中的轮次，避免同一批样本重复进入同一个训练 batch。
+
+        source: "base"（Initial Base 真实标签）或 "stream"（流式样本）。
+        流式样本只允许携带伪标签，写入真实标签会直接报错。
         """
+        if source == "stream" and label_source == "ground_truth":
+            raise RuntimeError(
+                "禁止把流式真实标签写入 Replay（必须使用 initial_teacher_pseudo）")
+        if source not in self.sources:
+            raise ValueError(f"未知来源: {source}")
         images = images.cpu()
         labels = labels.cpu()
         round_idx = int(round_idx)
+        self.sources[source] += int(len(labels))
+        self.label_sources[label_source] = \
+            self.label_sources.get(label_source, 0) + int(len(labels))
         for i in range(len(labels)):
             c = int(labels[i])
             if c < 0 or c >= self.num_classes:
@@ -92,6 +107,14 @@ class ClassBalancedReservoir:
             assert len(buf) <= self.caps[b]
         return True
 
+    def provenance(self):
+        return {"capacity": self.capacity, "size": len(self),
+                "class_balanced": self.class_balanced,
+                "per_class": self.per_class_counts(),
+                "added_by_source": dict(self.sources),
+                "added_by_label_source": dict(self.label_sources),
+                "n_replaced": int(self.total_replaced)}
+
     def state_dict(self):
         imgs, ys = self.get()
         return {"images": imgs, "labels": ys, "seen": self.seen.copy(),
@@ -101,6 +124,8 @@ class ClassBalancedReservoir:
                 "class_balanced": self.class_balanced,
                 "total_added": self.total_added,
                 "total_replaced": self.total_replaced,
+                "sources": dict(self.sources),
+                "label_sources": dict(self.label_sources),
                 "per_class": list(self.buffers)}
 
     @classmethod
@@ -112,6 +137,11 @@ class ClassBalancedReservoir:
         obj.rng.set_state(st["rng_state"])
         obj.total_added = int(st["total_added"])
         obj.total_replaced = int(st["total_replaced"])
+        obj.sources = dict(st.get("sources", {"base": obj.total_added,
+                                              "stream": 0}))
+        obj.label_sources = dict(st.get("label_sources",
+                                        {"ground_truth": obj.total_added,
+                                         "initial_teacher_pseudo": 0}))
         obj.buffers = []
         for b in st["per_class"]:
             # 兼容旧断点：早期条目只有 (image, label)，缺少轮次记为 -1

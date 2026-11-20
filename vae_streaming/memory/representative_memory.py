@@ -168,6 +168,7 @@ class RepresentativeMemory:
 
     def summary(self, stats=None):
         out = {"budget": self.budget, "dim": self.dim,
+               "n_features": int(len(self.features)),
                "quotas": self.quotas.tolist(),
                "versions": sorted(set(self.versions.tolist())),
                "last_round": sorted(set(self.last_round.tolist())),

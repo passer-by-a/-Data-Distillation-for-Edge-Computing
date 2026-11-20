@@ -16,11 +16,20 @@ def build_parser(default_scenario, default_methods):
     ap.add_argument("--initial-fraction", type=float, default=None)
     ap.add_argument("--class-quota", type=int, default=None,
                     help="IID 下每类每轮的固定样本数（base 自动吸收类别差异）")
+    ap.add_argument("--group-rounds", type=int, default=None,
+                    help="先按该轮数构造流式数据，再等分到 --rounds 轮"
+                         "（保证数据与顺序不变，只改粒度）")
     ap.add_argument("--update-every", type=int, default=None,
                     help="每累积多少轮做一次在线 VAE 更新（默认 1）")
     ap.add_argument("--history-mode", default=None, choices=["full", "replay"],
                     help="历史预算口径：full=累计全部历史；replay=固定预算 "
                          "replay+current（消融对齐用）")
+    ap.add_argument("--label-mode", default=None,
+                    choices=["supervised_stream", "unlabeled_after_base"],
+                    help="标签协议：supervised_stream（原始全监督）或 "
+                         "unlabeled_after_base（仅 Base 有真实标签）")
+    ap.add_argument("--pseudo-threshold", type=float, default=None,
+                    help="固定 Teacher 伪标签置信度阈值（仅无标签协议）")
     ap.add_argument("--initial-epochs", type=int, default=None)
     ap.add_argument("--vae-steps", type=int, default=None)
     ap.add_argument("--cloud-steps", type=int, default=None)
@@ -48,10 +57,16 @@ def run_cli(default_scenario, default_methods):
         cfg["stream"]["initial_fraction"] = args.initial_fraction
     if args.class_quota is not None:
         cfg["stream"]["class_quota"] = args.class_quota
+    if args.group_rounds is not None:
+        cfg["stream"]["group_rounds"] = args.group_rounds
     if args.update_every is not None:
         cfg["vae"]["update_every_rounds"] = args.update_every
     if args.history_mode is not None:
         cfg["stream"]["history_mode"] = args.history_mode
+    if args.label_mode is not None:
+        cfg["stream"]["label_mode"] = args.label_mode
+    if args.pseudo_threshold is not None:
+        cfg.setdefault("pseudo_labels", {})["threshold"] = args.pseudo_threshold
     if args.budget is not None:
         cfg["memory"]["representative_budget"] = args.budget
     if args.initial_epochs is not None:

@@ -1,0 +1,99 @@
+# 第二阶段无标签流式协议（第一版）
+#   Initial Labeled Base 9800 + Unlabeled Streaming 39200（80 轮 × 490）
+#   Online VAE 每 2 轮更新一次（40 次 × 150 步 = 6000 步）
+#   Multi-MLP DM（3 个冻结随机 MLP）+ 固定 Initial Base Teacher 伪标签
+#   full_sync + int8 量化；云端固定训练预算，不做基于独立验证集的逐轮选优
+protocol_version: vae_streaming_v2_unlabeled
+dataset: cifar10
+num_classes: 10
+val_ratio: 0.02
+split_seed: 42
+feature_dim: 1024
+latent_dim: 16
+base_channels: 64
+
+stream:
+  scenario: iid
+  initial_fraction: 0.20          # base 9800 / 流式 39200
+  num_rounds: 80                  # 每轮 490
+  shuffle_seed: 42
+  class_balanced_initial: true
+  # supervised_stream | unlabeled_after_base
+  label_mode: unlabeled_after_base
+
+vae:
+  online_update: true
+  initial_epochs: 30
+  steps_per_round: 150            # 每次在线更新 150 步
+  update_every_rounds: 2          # 每 2 轮更新一次 → 40 次
+  batch_size: 128
+  lr: 0.001                       # Initial Base VAE
+  beta: 1.0e-4
+  cls_lambda: 0.1
+  online_lr: 1.0e-3
+  # 只对真实有标签的 Base Replay 生效；无标签流式窗口不计算 CE
+  online_cls_lambda: 0.1
+  replay_enabled: true
+  replay_ratio: 0.25
+  stability_enabled: false
+  lambda_stab: 0.0
+  augment: true
+  seed: 42
+
+pseudo_labels:
+  # 固定 Initial Base Teacher 的高置信度阈值（禁止按测试精度反复调节）
+  threshold: 0.9
+  source: initial_teacher_pseudo
+  teacher: fixed_initial_base
+
+memory:
+  replay_strategy: class_balanced
+  raw_replay_capacity: 1000       # 只保存 Initial Base 真实有标签样本
+  representative_budget: 980
+  representative_init: kmeans
+
+alignment:
+  method: diagonal_affine
+  anchor_count: 200
+  max_scale: 3.0
+
+distillation:
+  method: dm
+  feature_type: multi_mlp
+  num_mappings: 3
+  feature_hidden: 2048
+  feature_out: 1024
+  feature_seed: 0
+  exact_target: true
+  updates_per_class: 20
+  lr: 0.01
+  weight_decay: 0.0
+  lambda_mean: 1.0
+  lambda_anchor: 0.01
+  seed: 42
+
+communication:
+  mode: full_sync
+  quantization: int8
+  patch_fraction: 0.10
+
+cloud:
+  head: mlp
+  incremental_training: true
+  steps_per_round: 200
+  lr: 0.001
+  wd: 0.0001
+  batch: 256
+  seed: 0
+  val_mode: external
+  epochs: 50
+  # 禁止用独立验证集标签逐轮选择模型：固定训练协议
+  select_best_on_val: false
+
+evaluation:
+  per_round: true
+  test_int8: true
+
+results_dir: vae_streaming/results
+checkpoints_dir: vae_streaming/checkpoints
+figures_dir: vae_streaming/figures

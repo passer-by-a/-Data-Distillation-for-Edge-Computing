@@ -22,6 +22,8 @@ class StreamingStatistics:
         self.estimated = np.zeros(self.num_classes, dtype=bool)
         self.total_updates = 0
         self.log = []
+        # 标签来源审计：真实标签 vs Initial Base Teacher 伪标签
+        self.label_sources = {}
 
     # ------------------------------------------------------------------
     def reset(self, version):
@@ -55,8 +57,13 @@ class StreamingStatistics:
         self.version = int(version)
 
     # ------------------------------------------------------------------
-    def update(self, features, labels, version, round_idx=None):
-        """合并当前轮新样本。features: [n,D]；labels: [n]"""
+    def update(self, features, labels, version, round_idx=None,
+               label_source="ground_truth"):
+        """合并当前轮新样本。features: [n,D]；labels: [n]
+
+        label_source 显式区分 ground_truth / initial_teacher_pseudo，
+        伪标签统计与真实标签统计分别计数，禁止混为一体。
+        """
         if int(version) != self.version:
             raise ValueError(
                 f"统计量版本 v{self.version} 与新特征版本 v{version} 不一致；"
@@ -67,6 +74,8 @@ class StreamingStatistics:
             raise ValueError(f"特征形状错误: {tuple(features.shape)}")
         if len(features) != len(labels):
             raise ValueError("features 与 labels 长度不一致")
+        if len(features) == 0:
+            return self
         batch_counts = []
         for c in torch.unique(labels).tolist():
             f = features[labels == c]
@@ -86,8 +95,11 @@ class StreamingStatistics:
                     delta.pow(2) * (old_n * n / new_n)
             self.count[c] = new_n
         self.total_updates += 1
+        self.label_sources[label_source] = \
+            self.label_sources.get(label_source, 0) + int(len(features))
         self.log.append({"version": int(version), "round": round_idx,
                          "n": int(len(features)),
+                         "label_source": label_source,
                          "batch_class_counts": batch_counts})
         return self
 
@@ -128,7 +140,8 @@ class StreamingStatistics:
                 "per_class_count": self.count.tolist(),
                 "n_classes_seen": int((self.count > 0).sum()),
                 "estimated_classes": [int(c) for c in np.where(self.estimated)[0]],
-                "total_updates": self.total_updates}
+                "total_updates": self.total_updates,
+                "label_sources": dict(self.label_sources)}
 
     # ------------------------------------------------------------------
     def state_dict(self):
@@ -137,6 +150,7 @@ class StreamingStatistics:
                 "mean": self.mean.clone(), "M2": self.M2.clone(),
                 "estimated": self.estimated.copy(),
                 "total_updates": self.total_updates,
+                "label_sources": dict(self.label_sources),
                 "log": copy.deepcopy(self.log)}
 
     @classmethod
@@ -147,5 +161,6 @@ class StreamingStatistics:
         obj.M2 = st["M2"].clone()
         obj.estimated = np.asarray(st["estimated"]).copy()
         obj.total_updates = int(st["total_updates"])
+        obj.label_sources = dict(st.get("label_sources", {}))
         obj.log = copy.deepcopy(st["log"])
         return obj

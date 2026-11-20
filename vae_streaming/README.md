@@ -23,12 +23,14 @@
 
 ```yaml
 stream:
-  initial_fraction: 0.20     # Initial Base Set = 9,801 张（类平衡）
-  num_rounds: 5              # 第一批最小实验；正式协议为 20
+  initial_fraction: 0.20     # Initial Base Set = 9,800 张（CIFAR-10 各类 967–995，类平衡）
+  num_rounds: 80             # 80 × 490 = 39,200；80 轮为当前主口径
   scenario: iid              # iid / label_shift / covariate_shift
+  label_mode: supervised_stream   # supervised_stream / unlabeled_after_base
 ```
 
-- 每轮大小约 7,840 张（49,000 − 9,801 = 39,199，按 5 轮均分）。
+- 80 轮每轮 490 张（49,000 − 9,800 = 39,200 均分）；5 轮（7,840/轮）、
+  40 轮（980/轮）与 392 轮（100/轮）是同一协议下的其他分组口径。
 - `CausalStream.round(t)` 有访问守卫：访问 `t+1` 及以后直接抛错。
 - Base 与所有轮次索引互斥；`assert_no_leakage(t, idx)` 可审计。
 - 测试集只用于评估；不进入 VAE 训练、统计记忆、代表集或 DM。
@@ -38,11 +40,14 @@ stream:
 
 ### 2.0 长流小批量协议
 
-小批量、多轮次时按下面两个参数构造，避免“每轮 100 张却更新 150 步”的失配：
+小批量、多轮次时按下面三个参数构造，避免“每轮 100 张却更新 150 步”的失配：
 
 - `stream.class_quota`：每类每轮固定张数。Base 自动吸收类别总数差异
   （CIFAR-10 各类 967–995 张，合计 9,800 = 20%），之后每轮严格 100 张。
   392 轮 × 10 张/类正好耗尽每类剩余 3,920 张。
+- `stream.group_rounds`：先按 `class_quota` 构造细粒度轮次，再合并成更少的
+  外层轮。40 轮折中口径用 `group_rounds=392`：内部仍按每类 10 张划分，
+  外层 40 组各 980 张，每组做一次在线更新（40 × 150 步）。
 - `vae.update_every_rounds`：累积若干轮后再做一次在线 VAE 更新。
   取 10 时，每 10 轮累积约 1,000 张，更新仍为 150 步；
   其余轮次只做编码、统计、代表集与云端同步，Encoder 版本保持不变。
@@ -85,7 +90,26 @@ Replay + 当前轮作为 DM 目标，更新轮与非更新轮的目标集合构�
 **VAE 预训练泄漏**：主实验的初始 VAE 只使用 Initial Base Set 训练（30 epoch），
 不使用第一阶段 49k 预训练权重。第一阶段权重只作为非因果离线参考。
 
-### 2.1 冻结特征归一化
+### 2.1 标签协议（`stream.label_mode`）
+
+同一套流式代码支持两种标签协议，结果 JSON 的 `label_mode` 字段记录实际口径：
+
+- `supervised_stream`（默认，当前主口径）：Initial Base 与每轮流式数据都带真实标签，
+  在线 VAE 的分类项对当前窗口与 Base Replay 都生效。
+- `unlabeled_after_base`：只有 Initial Base 的 9,800 张带真实标签。`CausalStream`
+  返回 `UnlabeledBatch`，该对象没有标签字段；`sample_ids` 只是原始训练集索引，
+  审计测试校验对应位置的真实标签已被密封。流式标签只能来自
+  **固定 Initial Base Teacher** 的伪标签：
+  - Teacher 是 Initial Base VAE 的深拷贝，`eval()` + 冻结，version 恒为 0，全程不更新；
+  - 阈值 `pseudo_labels.threshold=0.9`，低于阈值的样本不进入分类损失；
+  - 伪标签来源固定为 `PSEUDO_SOURCE=initial_teacher_pseudo`，不与其他标签来源混用；
+  - Replay 只保存 Initial Base 的真实有标签样本（容量 1,000）；
+  - `vae_losses(..., n_unlabeled)` 让 CE 只对伪标签部分求均值，真实标签 replay
+    仍提供重构/稳定性梯度。
+- 协议审计：`tests/test_label_protocol.py`（6 项）覆盖标签密封、Teacher 冻结、
+  伪标签来源、无标签批次可运行与预算校验。
+
+### 2.2 冻结特征归一化
 
 逐通道 z-score 统计量只在 Initial Base Set 上拟合一次并冻结。
 这样边缘与云端共享同一个固定线性变换，编码器更新不会破坏两侧一致性，
@@ -103,6 +127,7 @@ Replay + 当前轮作为 DM 目标，更新轮与非更新轮的目标集合构�
 | D. Feature Alignment | `models/feature_alignment.py` | 对角仿射 `z_new ≈ a⊙z_old+b`，锚点拟合/留出检验 |
 | E. Representative Memory | `memory/representative_memory.py` | 固定预算 980，稳定 ID / 版本 / 轮次 |
 | F. Cloud Incremental | `cloud/incremental_trainer.py` | 保留模型与优化器状态；可切换每轮 scratch |
+| G. 伪标签 | `models/pseudo_labeler.py` | `FixedTeacher`（Initial Base 冻结快照）+ 阈值伪标签；仅 `unlabeled_after_base` 使用 |
 
 ### 3.1 Online VAE
 
@@ -149,6 +174,9 @@ L_SDM = ||mean(f(real_z)) − mean(f(syn_z))||² + λ_a·||S − S_aligned_prev|
 - 全量同步模式优化全部代表；固定预算 patch 模式只优化本轮允许更新的位置，
   其余位置严格保持对齐后的旧值。
 - 不包含方差/协方差/diversity 项；`λ_a` 只是稳定性锚点。
+- `distillation.feature_type=multi_mlp` 时用 3 个不同种子的冻结随机 MLP，
+  对 3 组均值匹配损失取平均（`dm_multi`）；`feature_type=plain` 为单 MLP（`dm`）。
+  两者共享其余全部预算与协议。
 
 ### 3.5 通信
 
@@ -165,8 +193,34 @@ L_SDM = ||mean(f(real_z)) − mean(f(syn_z))||² + λ_a·||S − S_aligned_prev|
 ## 4. 运行
 
 ```bash
-# 单元测试（41 项，含完整流水线断点续跑与协议审计回归）
-python -m pytest vae_streaming/tests/test_streaming_protocol.py -q
+# 单元测试（34 项：28 项流式协议 + 6 项标签协议）
+python -m pytest vae_streaming/tests -q
+
+# 80 轮监督五方法（当前主口径：80 × 490，每 2 轮更新一次）
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10_supervised_multi80_u2.yaml \
+  --methods dm,dm_multi,online_kmeans,online_moment,online_reservoir \
+  --seeds 42 --tag sup80
+
+# 80 轮无标签协议（固定 Teacher 伪标签 + Multi-MLP DM）
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10_unlabeled_multi80_u2.yaml \
+  --methods dm_multi,online_kmeans,online_moment,online_reservoir \
+  --seeds 42 --label-mode unlabeled_after_base \
+  --pseudo-threshold 0.9 --tag u2
+
+# 392 轮四方法（三 seeds）
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10.yaml \
+  --methods online_kmeans,online_moment,online_reservoir,dm \
+  --seeds 42,43,44 --rounds 392 --class-quota 10 \
+  --update-every 10 --tag r392cmp
+
+# 40 轮折中口径（内部 392 细分轮 → 40 组 × 980 张，每组更新一次）
+python -m vae_streaming.experiments.run_iid \
+  --config vae_streaming/configs/cifar10.yaml \
+  --methods dm,dm_multi --seeds 42 --rounds 40 --class-quota 10 \
+  --group-rounds 392 --update-every 1 --tag r40cmp42
 
 # CIFAR-100 IID 主实验（单方法）
 python -m vae_streaming.experiments.run_iid \
@@ -179,23 +233,11 @@ python -m vae_streaming.experiments.run_iid \
   --methods online_kmeans,online_moment,dm \
   --seeds 42,43,44
 
-# 长流小批量：392 轮，每类每轮 10 张，每累积 10 轮做一次在线更新
-python -m vae_streaming.experiments.run_iid \
-  --config vae_streaming/configs/cifar10.yaml \
-  --methods online_kmeans,online_moment,dm \
-  --seeds 42 --rounds 392 --class-quota 10 --update-every 10 --tag r392p2
-
-# 历史预算对齐消融（Moment 改为 replay+current 固定预算）
-python -m vae_streaming.experiments.run_iid \
-  --config vae_streaming/configs/cifar10.yaml \
-  --methods online_moment --seeds 42 --rounds 392 \
-  --class-quota 10 --update-every 10 --history-mode replay --tag r392p2rep
-
 # 长流报表与图（按轮数/标签过滤，避免混进 5 轮主表）
 python -m vae_streaming.experiments.make_report --dataset cifar10 \
-  --rounds 392 --tag _r392p2 --out vae_streaming/results/cifar10/main_table_r392p2.md
+  --rounds 392 --tag _r392cmp --out vae_streaming/results/cifar10/main_table_r392cmp.md
 python -m vae_streaming.experiments.make_figures --dataset cifar10 \
-  --rounds 392 --tag _r392p2 --out-suffix r392p2
+  --rounds 392 --tag _r392cmp --out-suffix r392cmp
 
 # 分布变化场景
 python -m vae_streaming.experiments.run_label_shift \
@@ -232,7 +274,7 @@ python -m vae_streaming.experiments.make_figures
 
 ### 5.1 CIFAR-100，IID，5 轮，预算 980（最终 50:1），3 seeds
 
-初始 Base VAE 仅见 9,801 张图；所有方法共享同一 Initial Base VAE 与云端协议。
+初始 Base VAE 仅见 9,800 张图；所有方法共享同一 Initial Base VAE 与云端协议。
 初始精度 **35.91±0.80**。
 
 | 方法 | 最终 | 在线平均 | 最终 F1 | 累计通信 | 组/单图方差比 |
@@ -278,6 +320,73 @@ CIFAR-10 的 20% Base 已能训练出较强编码器，初始精度 **76.08±0.5
 | CIFAR-10 | Label Shift | 78.51±0.42 | 74.17±1.57 | 79.59±0.30 |
 | CIFAR-10 | Covariate Shift | 74.22±0.63 | 69.79±0.48 | — |
 
+### 5.3 CIFAR-10，IID，80 轮（**当前主口径**，seed 42）
+
+协议：80 轮 × 490 张（Base 9,800 + 流式 39,200），每 2 轮做一次在线更新
+（40 次 × 150 步 = 6,000 步），每轮同步 980 个代表（INT8 full_sync，累计 82.43 MB）。
+五方法共享同一 Initial Base VAE 权重（各方法权重逐位相同），DM / K-means / Moment
+共用同一初始代表集；40 次更新记录的 `encoder_sha1` 全部一致
+（每方法 40 条，末轮 `c99628fc00f2373f`），数据流 `stream_sha1=b75d2a809942de30`。
+“r0”是第 0 轮结束后的精度；Reservoir 的 r0 略低是因为初始代表集用原始样本缓冲
+而不是 KMeans 质心，Base VAE 权重本身各方法逐位相同。
+
+| 方法 | r0 | 最终 | 在线平均 | 最终 F1 | 平均 F1 | INT8 | 方差比 | DM 耗时 |
+|---|---|---|---|---|---|---|---|---|
+| Plain DM（`dm`） | 76.27 | **78.44** | 74.26 | **78.40** | 74.22 | 78.39 | 2.54 | 8.4 s |
+| Multi-MLP DM（`dm_multi`） | 76.27 | 77.56 | 74.54 | 77.28 | **74.56** | 77.61 | 4.60 | 15.3 s |
+| VAE + K-means | 76.27 | 76.83 | 73.28 | 76.41 | 73.03 | 76.08 | 0.04 | 4.4 s |
+| VAE + Moment | 76.27 | 75.73 | 73.22 | 75.32 | 72.96 | 75.78 | 1.00 | 1.0 s |
+| Online Reservoir | 75.91 | 76.92 | **75.57** | 76.84 | 75.43 | 76.97 | 7.14 | 1.8 s |
+
+墙钟 258–293 s（DM 264.7 / Multi 274.9 / K-means 262.7 / Moment 258.1 / Reservoir 293.4）。
+
+1. **Plain DM 最终最好**：78.44，比 Multi-MLP 高 0.9、比 K-means 高 1.6、比 Moment 高 2.7。
+2. Multi-MLP 的在线平均与平均 F1 略高，但最终落后 Plain DM：多映射均值匹配在
+   80 轮里更容易提前收敛。
+3. Reservoir 的在线平均最高（75.57），说明“原始样本缓冲 + 当前 Encoder 重编码”
+   在早期很稳；最终比 Plain DM 低 1.5 点。
+4. Moment 在 80 轮口径下反而最低（75.73 < r0 76.27），累计统计的跨版本对齐误差
+   随轮数放大，需要单独归因。
+
+### 5.3b CIFAR-10，IID，80 轮无标签协议（`unlabeled_after_base`，seed 42）
+
+只有 Base 9,800 张有真实标签；39,200 张流式数据不带标签，CE 只用固定 Initial Base
+Teacher 的伪标签（阈值 0.9）。80 轮共接受 20,625 条伪标签（平均接受率 52.6%），
+Teacher 指纹 `7343521e454f4f08`（version 0）。四方法逐轮 `encoder_sha1` 一致
+（末轮 `a450a63a284d62fd`），数据流 `stream_sha1=a914f9bb4998e17e`。
+
+| 方法 | r0 | 最终 | 在线平均 | 最终 F1 | 平均 F1 | INT8 | 方差比 |
+|---|---|---|---|---|---|---|---|
+| Multi-MLP DM | 76.27 | **60.64** | 63.78 | **60.19** | **63.59** | 60.61 | 9.11 |
+| Online Reservoir | 75.91 | **65.70** | **67.24** | 65.40 | 66.94 | 65.65 | 13.55 |
+| VAE + K-means | 76.27 | 58.99 | 63.65 | 58.14 | 62.91 | 58.46 | 0.09 |
+| VAE + Moment | 76.27 | 57.58 | 62.05 | 53.96 | 59.95 | 57.62 | 1.00 |
+
+1. **无标签协议整体大幅低于监督 80 轮**（最好 65.70 vs 78.44），说明当前固定的
+   Initial Base Teacher 不足以支撑 80 轮无标签流；该协议只作为对照，不进主表。
+2. 伪标签类别严重偏斜：接受的 20,625 条中，各类为
+   `[2466, 2878, 1839, 31, 2346, 968, 2450, 2475, 2432, 2740]`，第 3 类只有 31 条。
+   这是 Teacher 置信度偏置造成的，不是数据流构造造成的（数据流不按类别分桶）。
+3. Reservoir 在该协议下明显最好：它不依赖伪标签的类别均衡，只用固定预算原始样本；
+   DM 仍然高于 K-means / Moment。
+
+### 5.3c CIFAR-10，IID，40 轮折中口径（seed 42）
+
+内部仍按每类每轮 10 张构造 392 个细分轮，再合并为 40 个外层轮（各 980 张），
+每组做一次在线更新（40 × 150 步 = 6,000 步），累计同步 41.72 MB。
+三方法共享同一 Initial Base 与 Encoder 轨迹（末轮 `d4d5307ba45be58e`）。
+
+| 方法 | r0 | 最终 | 在线平均 | 最终 F1 | 平均 F1 | INT8 | 方差比 |
+|---|---|---|---|---|---|---|---|
+| Plain DM | 75.97 | **77.58** | 74.86 | 77.51 | 74.88 | 77.52 | 1.84 |
+| Multi-MLP DM | 75.97 | 77.51 | **75.27** | **77.52** | **75.37** | 77.48 | 3.58 |
+| Residual DM（`lambda_latent=1.0`） | 75.97 | 74.08 | 72.11 | 73.81 | 72.28 | 74.01 | 0.63 |
+
+- 40 轮与 80 轮的排序一致：Plain DM ≈ Multi-MLP DM > 其他；两种 DM 的差距在噪声内，
+  且更新次数减半后仍能回到 77.5 左右。
+- Residual DM 在加入 `lambda_latent=1.0` 后明显掉点（74.08），说明潜空间均值项
+  与固定随机特征均值匹配叠加会互相干扰；该变体只作为结构对照，不进入主表。
+
 ### 5.4 Replay + 原版 DM 明细（CIFAR-100 IID，3 seeds，预算 980）
 
 | 方法 | 最终 | 在线平均 | 累计通信 |
@@ -305,12 +414,14 @@ Replay 重编码提供当前版本的训练特征，DM 在此之上做逐类均�
 本机（RTX 4090 D）5 轮单方法边缘总耗时约 30–100 s，峰值显存 <1 GB；
 云端 6 次训练合计约 2–3 s。完整同步累计约 6.1 MB，patch 10% 约 1.57 MB（理论字节）。
 
-图（`figures/`，均由当前三方法结果生成）：
+图（`figures/`）：
 
-- `cifar100_accuracy_iid.png`、`cifar100_communication_iid.png`、
-  `cifar100_drift_alignment_iid.png`
-- `cifar10_accuracy_iid.png`、`cifar10_communication_iid.png`、
-  `cifar10_drift_alignment_iid.png`
+- 5 轮：`cifar100_accuracy_iid.png`、`cifar100_communication_iid.png`、
+  `cifar100_drift_alignment_iid.png`、`cifar10_accuracy_iid.png`、
+  `cifar10_communication_iid.png`、`cifar10_drift_alignment_iid.png`
+- 80 轮监督五方法：`sup80_five_methods_seed42.png`
+- 80 轮无标签四方法：`u2_four_methods_seed42.png`、`dm_multi_u2_seed42_curve.png`
+- 392 轮（历史口径）：`cifar10_r392p2_*_iid.png`
 
 Label/Covariate Shift 的图在结果重跑后再生成。
 
@@ -372,33 +483,38 @@ Stage 2（CIFAR-100 IID，3 seeds，full sync，100% 更新）：
 4. 阶段二的 real features：`dm` 用 replay + current，
    覆盖当前版本下的历史与新增样本。
 
-### 5.9 长流 392 轮（CIFAR-10，class_quota=10，update_every=10，tag r392p2）
+### 5.9 长流 392 轮（CIFAR-10，class_quota=10，update_every=10，tag r392cmp，3 seeds）
 
-单种子 42；392 轮恰好耗尽每类 3,920 张。末轮 flush（`final_flush=True`），
-`vae_pending_leftover=0`，`n_train_used=49,000`；四种方法 Encoder 轨迹逐位相同
-（r391 `encoder_sha1=de208c5776faa5e9`），累计通信 390,564 KB（993.8 KB/轮，INT8 full_sync）。
+392 轮 × 每类 10 张恰好耗尽每类 3,920 张；每 10 轮做一次在线更新，
+末轮强制 flush（`final_flush=True`，r391），`vae_pending_leftover=0`，`n_train_used=49,000`。
+每 seed 内四种方法共享同一 Initial Base VAE 与逐位相同的 Encoder 轨迹
+（r391 `encoder_sha1`：seed42 `de208c5776faa5e9`、seed43 `2ff0ae1c07fb8367`、
+seed44 `49bc9511bd4c1291`，方法间 0 差异），累计通信 399.94 MB（INT8 full_sync，约 1 MB/轮）。
 
-| 方法 | 初始 | 最终 | 在线平均 | 最终 F1 | INT8 | 方差比 | 对齐误差 |
-|---|---|---|---|---|---|---|---|
-| online_kmeans | 75.97 | 74.09 | 74.60 | 73.74 | 73.48 | 0.033 | 0.129 |
-| online_moment | 75.97 | **77.83** | 75.56 | **77.61** | **77.83** | 1.000 | 0.129 |
-| dm | 75.97 | 76.88 | **75.76** | 76.75 | 76.87 | 2.756 | 0.129 |
-| online_moment（history_mode=replay 消融） | 75.97 | 77.10 | 75.71 | 77.03 | 77.04 | — | — |
+| 方法 | r0 | 最终 | 在线平均 | 最终 F1 | 平均 F1 | INT8 | 方差比 | DM 耗时 |
+|---|---|---|---|---|---|---|---|---|
+| online_kmeans | 76.87±0.69 | 77.47±2.25 | 74.48±0.29 | 77.19±2.40 | 74.15±0.37 | 76.59±2.29 | 0.04 | 4.5 s |
+| online_moment | 76.87±0.69 | 77.51±0.89 | 75.46±0.30 | 77.16±0.94 | 75.16±0.34 | 77.47±0.85 | 1.00 | 4.3 s |
+| online_reservoir | 76.20±0.19 | 78.33±1.03 | **75.75±0.12** | 78.24±1.10 | 75.62±0.08 | 78.31±1.06 | 8.27 | 7.3 s |
+| dm | 76.87±0.69 | **79.14±1.37** | 75.72±0.25 | **79.13±1.31** | **75.67±0.22** | **79.14±1.38** | 2.91 | 37.5 s |
 
-时间拆账（秒）：边缘计算 227–265，评估 94–102，云端训练 225–251，墙钟 601–643；
-非更新轮约 0.9 s，更新轮约 5 s。
+逐 seed 最终精度：DM 78.09 / 78.25 / 81.08；Reservoir 76.95 / 78.60 / 79.43；
+Moment 76.64 / 77.17 / 78.73；K-means 74.30 / 78.81 / 79.31。
 
-1. Moment 最终最好，DM 在线平均最高，K-means 低于初始（74.09 < 75.97），
-   需要单独排查 coreset / 质心更新。
-2. 消融：固定预算（replay+current，1,100 样本）比累计统计低 0.73，
-   Moment 的收益部分来自历史信息量，论文必须写清口径。
-3. 与修改前 `r392u10`（K-means 78.48 / Moment 78.37 / DM 81.11）差异较大：
-   DM 由 `reencode` 改为 `diagonal_affine` 可解释一部分，K-means 的差异尚无定论。
-   两组数字口径不同，不能混用；需要单变量对照（关闭 replay 去重、关闭末轮 flush）定位。
+1. **DM 在 392 轮口径下最好**（79.14±1.37），比 Reservoir 高 0.8、比 Moment / K-means 高 1.6。
+2. K-means 的方差最大：seed42 只有 74.30，比其他两个 seed 低 4 点以上；
+   均值为 77.47，但不能只报告单 seed。
+3. Reservoir 的在线平均最高且最稳（75.75±0.12），但最终被 DM 反超 0.8 点；
+   说明固定预算原始样本在长流中衰减较慢，但缺少 DM 的分布匹配。
+4. 与本文件 5.3 的 80 轮口径相比，方法排序一致（DM > Reservoir > Moment ≈ K-means），
+   绝对精度更高是因为 392 轮把每轮压到 100 张、更新更频繁。
+5. 旧 `r392p2`（单 seed 42，改造前，DM 用 `reencode`）只保留为历史记录：
+   K-means 74.09 / Moment 77.83 / DM 76.88 / Moment(replay) 77.10，
+   与当前 `r392cmp` 的 DM 口径不同，不能混用。
 
 ---
 
-## 6. 测试覆盖（任务书 19 项 + 6 项审计回归）
+## 6. 测试覆盖（28 项流式协议 + 6 项标签协议）
 
 | # | 检查 | 测试 |
 |---|---|---|
@@ -427,6 +543,17 @@ Stage 2（CIFAR-100 IID，3 seeds，full sync，100% 更新）：
 | 23 | DM 目标集合统一为 replay+current | `test_dm_target_scope_unified` |
 | 24 | 完整流水线断点恢复 exact 对齐 | `test_full_pipeline_resume` |
 | 25 | 更新预算与上传预算分离 | `test_update_upload_budget_separation` |
+
+标签协议（`tests/test_label_protocol.py`，6 项，`label_mode=unlabeled_after_base`）：
+
+| # | 检查 | 测试 |
+|---|---|---|
+| L1 | 流式真实标签不可访问（标签密封） | `test_1_stream_labels_inaccessible` |
+| L2 | 打乱流式真实标签不影响运行结果 | `test_2_stream_label_shuffle_invariance` |
+| L3 | 无真实标签也能跑完流水线 | `test_3_runs_without_stream_labels` |
+| L4 | 伪标签只来自固定 Initial Base Teacher | `test_4_pseudo_labels_come_from_fixed_teacher` |
+| L5 | 预算配置校验 | `test_5_budget_config` |
+| L6 | 完整运行的预算统计 | `test_5_budget_from_full_run` |
 
 ---
 
@@ -500,8 +627,9 @@ Stage 2（CIFAR-100 IID，3 seeds，full sync，100% 更新）：
 
 ## 8. 已知限制
 
-1. **5 轮 + 20% Base 是早期阶段**：初始 VAE 只见过 9,801 张图，特征质量明显弱于
-   第一阶段 49k 全量 VAE；本阶段结论只描述因果早期的行为，不外推到 20 轮收敛。
+1. **20% Base 是共同瓶颈**：初始 VAE 只见过 9,800 张图，特征质量明显弱于
+   第一阶段 49k 全量 VAE。5 / 40 / 80 / 392 轮共享同一 Initial Base，
+   增加轮数只能改善增量维护，不能补齐编码器上限。
 2. **初始代表集使用 Base 标签**：Base 的标签在因果协议内可访问；但这不是无监督方法。
 3. **对角仿射是近似**：held-out 相对误差约 0.16；加入 stability 项可降到 0.06，
    但仍不能把对齐后的历史统计量宣称为真实历史图像在新 Encoder 下的精确分布。
@@ -521,3 +649,10 @@ Stage 2（CIFAR-100 IID，3 seeds，full sync，100% 更新）：
    若要在固定预算下使用，需要提高 patch 比例或增加轮次覆盖全部位置。
 10. **对齐误差仍是主要风险**：对角仿射 held-out 相对误差 0.160；加入 stability 项
     可降到 0.062，但仍不能把对齐统计量当作精确历史分布。
+11. **80 轮主口径只有 seed 42**：5.3 / 5.3b / 5.3c 都是单 seed，方法差距小于 1 点时
+    不能当作定论；392 轮已有 3 seeds（5.9），80 轮扩 seed 是下一步。
+12. **无标签协议不能替代监督主表**：伪标签接受率 52.6%，且类别严重偏斜
+    （第 3 类仅 31 条），80 轮最好只有 65.70。若要继续，需要更换 Teacher 或
+    按类别校准阈值，不能只看总体接受率或总体精度。
+13. **K-means 在 392 轮 seed42 掉点**（74.30，另两个 seed 为 78.81 / 79.31）：
+    原因尚未定位；报告时必须同时给三 seed 均值与逐 seed 值，不能只报单 seed。

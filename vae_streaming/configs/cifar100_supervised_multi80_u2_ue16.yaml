@@ -1,0 +1,90 @@
+# 第二阶段监督流式协议（CIFAR-100，80 轮口径）
+#   Initial Base 9801 + Streaming 39200（80 轮 × 490，预算 980）
+#   与 cifar10_supervised_multi80_u2.yaml 同协议，仅 dataset/num_classes 不同
+#   （流式真实标签可见；不覆盖任何旧配置或旧结果）
+protocol_version: vae_streaming_v2_supervised80_c100_ue16
+dataset: cifar100
+num_classes: 100
+val_ratio: 0.02
+split_seed: 42
+feature_dim: 1024
+latent_dim: 16
+base_channels: 64
+
+stream:
+  scenario: iid
+  initial_fraction: 0.20          # base 9801 / 流式 39200
+  num_rounds: 80                  # 每轮 490
+  shuffle_seed: 42
+  class_balanced_initial: true
+  # supervised_stream | unlabeled_after_base
+  label_mode: supervised_stream
+
+vae:
+  online_update: true
+  initial_epochs: 30
+  steps_per_round: 150            # 每次在线更新 150 步
+  update_every_rounds: 16         # 每 16 轮更新一次 → 5 次 × 150 = 750 步
+  batch_size: 128
+  lr: 0.001                       # Initial Base VAE
+  beta: 1.0e-4
+  cls_lambda: 0.1
+  online_lr: 1.0e-3
+  online_cls_lambda: 0.1
+  replay_enabled: true
+  replay_ratio: 0.25
+  stability_enabled: false
+  lambda_stab: 0.0
+  augment: true
+  seed: 42
+
+memory:
+  replay_strategy: class_balanced
+  raw_replay_capacity: 1000
+  representative_budget: 980
+  representative_init: kmeans
+
+alignment:
+  method: diagonal_affine
+  anchor_count: 200
+  max_scale: 3.0
+
+distillation:
+  method: dm
+  # 不写 feature_type：Plain DM 使用单个随机 MLP；dm_multi 由方法 override 设 3 个
+  feature_hidden: 2048
+  feature_out: 1024
+  feature_seed: 0
+  exact_target: true
+  updates_per_class: 20
+  lr: 0.01
+  weight_decay: 0.0
+  lambda_mean: 1.0
+  lambda_anchor: 0.01
+  seed: 42
+
+communication:
+  mode: full_sync
+  quantization: int8
+  patch_fraction: 0.10
+
+cloud:
+  head: mlp
+  incremental_training: true
+  steps_per_round: 200
+  lr: 0.001
+  wd: 0.0001
+  batch: 256
+  seed: 0
+  val_mode: external
+  epochs: 50
+  # 与 u2 口径保持一致：云端固定训练协议，不做逐轮 val 选优
+  select_best_on_val: false
+
+evaluation:
+  per_round: true
+  test_int8: true
+
+results_dir: vae_streaming/results
+checkpoints_dir: vae_streaming/checkpoints
+figures_dir: vae_streaming/figures

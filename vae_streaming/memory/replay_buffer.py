@@ -148,3 +148,74 @@ class ClassBalancedReservoir:
             obj.buffers.append([
                 (e[0], int(e[1]), int(e[2]) if len(e) > 2 else -1) for e in b])
         return obj
+
+
+class FeatureReservoir:
+    """固定预算、类平衡的潜变量 Reservoir（不保存原始图像）。
+
+    与 ClassBalancedReservoir 相同的随机替换语义，但只管理槽位选择状态，
+    特征本体由调用方的代表集张量持有。跨 Encoder 版本时，调用方必须先对
+    现有特征做 alignment，再 `offer` 当前轮特征。
+    """
+
+    def __init__(self, caps, seed=0, seen=None):
+        self.caps = [int(c) for c in caps]
+        if any(c < 0 for c in self.caps):
+            raise ValueError("caps 不能为负")
+        self.rng = np.random.RandomState(int(seed))
+        self.seen = (np.array(self.caps, dtype=np.int64) if seen is None
+                     else np.asarray(seen, dtype=np.int64).copy())
+        self.total_added = 0
+        self.total_replaced = 0
+
+    @staticmethod
+    def slots(labels, num_classes):
+        """返回每个类别的槽位下标；要求 labels 按类别聚簇（代表集顺序）。"""
+        lab = np.asarray(labels.cpu() if torch.is_tensor(labels) else labels)
+        return [np.where(lab == c)[0] for c in range(int(num_classes))]
+
+    def offer(self, features, labels, slots):
+        """按类平衡 reservoir sampling 选出要替换的槽位。
+
+        features: [n, d] 当前轮特征（CPU，已归一化）。
+        返回 (slot_idx, new_features)，可能为空。
+        """
+        out_idx, out_f = [], []
+        for f, y in zip(features, labels):
+            c = int(y)
+            self.seen[c] += 1
+            self.total_added += 1
+            j = int(self.rng.randint(0, int(self.seen[c])))
+            if j < self.caps[c]:
+                out_idx.append(int(slots[c][j]))
+                out_f.append(f)
+                self.total_replaced += 1
+        if not out_idx:
+            return torch.empty(0, dtype=torch.long), None
+        return torch.tensor(out_idx, dtype=torch.long), torch.stack(out_f, 0)
+
+    def per_class_counts(self):
+        return list(self.caps)
+
+    def state_dict(self):
+        return {"caps": list(self.caps), "seen": self.seen.copy(),
+                "rng_state": self.rng.get_state(),
+                "total_added": int(self.total_added),
+                "total_replaced": int(self.total_replaced)}
+
+    @classmethod
+    def from_state_dict(cls, st):
+        obj = cls(st["caps"], seed=0, seen=st["seen"])
+        obj.rng.set_state(st["rng_state"])
+        obj.total_added = int(st["total_added"])
+        obj.total_replaced = int(st["total_replaced"])
+        return obj
+
+    def provenance(self):
+        return {"capacity": int(sum(self.caps)),
+                "size": int(sum(self.caps)),
+                "class_balanced": True,
+                "per_class": list(self.caps),
+                "stored": "latent_only",
+                "n_added": int(self.total_added),
+                "n_replaced": int(self.total_replaced)}

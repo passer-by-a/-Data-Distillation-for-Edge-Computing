@@ -1,14 +1,4 @@
-"""
-全局配置 + 数据加载
-
-流程:
-  阶段1: 训练 EdgeVAE (16ch×8×8), 图片 ↔ 潜空间双向映射
-  阶段2: 在潜空间中蒸馏, 每类压缩为 IPC 个合成潜变量
-  下游: 直接在潜空间做分类 (不解码回像素), 见 backbones.py / exp_*.py
-
-最终产出:
-  - 合成潜变量库: [num_classes, IPC, latent_dim, H, W]
-"""
+"""EdgeVAE 训练与 CIFAR 数据加载配置"""
 
 import os
 
@@ -22,23 +12,9 @@ from torch.utils.data import DataLoader, Subset
 DATASET = os.environ.get("DATASET", "cifar10")   # cifar10 / cifar100
 DATA_ROOT = "./data"
 SAVE_DIR = "./checkpoints"   # 模型权重
-LOG_DIR   = "./logs"          # 日志文件
-RESULT_DIR = "./results"      # 图片/可视化
-PT_DIR    = "./pt"            # 潜空间产物 (合成潜变量/真实子集 .pt)
 if DATASET != "cifar10":
-    for _d in ["SAVE_DIR", "LOG_DIR", "RESULT_DIR", "PT_DIR"]:
-        globals()[_d] = os.path.join(globals()[_d], DATASET)
-for d in [SAVE_DIR, LOG_DIR, RESULT_DIR, PT_DIR]:
-    os.makedirs(d, exist_ok=True)
-
-
-def find_pt(name):
-    """查找潜空间产物: 优先 pt/, 找不到 fallback 到 results/ (兼容历史产物)"""
-    for d in [PT_DIR, RESULT_DIR]:
-        p = os.path.join(d, name)
-        if os.path.exists(p):
-            return p
-    return None
+    SAVE_DIR = os.path.join(SAVE_DIR, DATASET)
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ==================== 设备 (会自动检测, 无需手动改) ====================
 DEVICE = "cuda"  # 运行时自动 fallback 到 cpu
@@ -50,22 +26,12 @@ NUM_CLASSES      = 100 if DATASET == "cifar100" else 10
 BATCH_SIZE       = 128
 NUM_WORKERS      = 4
 
-CLASS_NAMES = ["airplane", "automobile", "bird", "cat", "deer",
-               "dog", "frog", "horse", "ship", "truck"]
-
-# ==================== 阶段1: EdgeVAE (16ch×8×8) ====================
+# ==================== EdgeVAE (16ch×8×8) ====================
 AE_LATENT_DIM = 16      # 潜空间通道数 (空间固定 8×8 → 1024 元素)
 AE_LR       = 1e-3
 AE_EPOCHS   = 100
 AE_BETA1    = 1e-4      # KL散度权重
 AE_CLS_LAMBDA = 0.1     # 分类损失权重 (multi-task: 重建 + λ*分类)
-
-# ==================== 阶段2: 潜空间数据集蒸馏 ====================
-IPC         = 100        # Images Per Class: 每类合成几张潜变量 (默认 100, 子集 1000; ipc 太小会过拟合/失稳)
-
-# ==================== 评估 ====================
-EVAL_BATCH_SIZE = 256
-
 
 # ============================================================
 # 数据加载 (CIFAR-10 / CIFAR-100)
@@ -156,8 +122,3 @@ def get_cifar10_loaders(data_root="./data", batch_size=128, num_workers=4,
     )
 
     return train_loader, val_loader, test_loader
-
-
-def denormalize(tensor):
-    """将 [-1, 1] 的张量反归一化到 [0, 1]"""
-    return (tensor * 0.5 + 0.5).clamp(0, 1)

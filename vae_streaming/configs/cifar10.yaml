@@ -9,6 +9,7 @@ base_channels: 64
 
 stream:
   scenario: iid
+  label_mode: supervised_stream
   initial_fraction: 0.20
   num_rounds: 5
   shuffle_seed: 42

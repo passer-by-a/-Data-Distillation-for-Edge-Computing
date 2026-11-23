@@ -26,10 +26,12 @@ from ..communication.payload_accounting import (CommunicationLedger,
                                                 select_patch_indices)
 from ..communication.quantization import decode_features, encode_features
 from ..data.causal_stream import CausalStream, regroup_stream_rounds
+from ..distillation.margin_matching import MarginQuantileMatcher
 from ..distillation.moment_calibration import streaming_moment_calibrate
 from ..distillation.online_coreset import OnlineKMeans, build_coreset
 from ..distillation.streaming_dm import StreamingDM
-from ..memory.replay_buffer import ClassBalancedReservoir
+from ..memory.replay_buffer import (ClassBalancedReservoir,
+                                    FeatureReservoir)
 from ..memory.representative_memory import RepresentativeMemory
 from ..memory.running_statistics import StreamingStatistics
 from ..models.feature_alignment import (estimate_feature_alignment,
@@ -76,6 +78,14 @@ METHOD_OVERRIDES = {
         "alignment": {"method": "diagonal_affine"},
         "distillation": {"method": "reservoir"},
         "communication": {"mode": "full_sync"}},
+    # 诊断：仅保存潜变量的 Reservoir（不保存历史原始图像，不做逐轮重编码），
+    # 跨版本只使用与主表相同的 diagonal_affine alignment。
+    "online_reservoir_latent": {
+        "vae": {"online_update": True, "replay_enabled": True,
+                "replay_ratio": 0.25},
+        "alignment": {"method": "diagonal_affine"},
+        "distillation": {"method": "reservoir_latent"},
+        "communication": {"mode": "full_sync"}},
 }
 
 
@@ -112,6 +122,12 @@ METHOD_OVERRIDES["dm_r392base"] = deep_merge(
      "alignment": {"method": "reencode"},
      "distillation": {"exact_target": False}})
 
+# 实验：Plain DM + 真实分类间隔分位数匹配（只对代表反传，lambda 首轮标定）
+METHOD_OVERRIDES["dm_margin"] = deep_merge(
+    METHOD_OVERRIDES["dm"],
+    {"distillation": {"margin_auto_lambda": True,
+                      "margin_grad_ratio": 0.2}})
+
 # 诊断用：冻结 Encoder（不做在线 VAE 更新），其余流程保持不变
 METHOD_OVERRIDES["dm_freeze"] = deep_merge(
     METHOD_OVERRIDES["dm"], {"vae": {"online_update": False}})
@@ -119,6 +135,9 @@ METHOD_OVERRIDES["dm_freeze"] = deep_merge(
 METHOD_OVERRIDES["dm_freeze_nodistill"] = deep_merge(
     METHOD_OVERRIDES["dm"], {"vae": {"online_update": False},
                              "distillation": {"updates_per_class": 0}})
+# 诊断用：保留 Online VAE、对齐与云端训练，只关闭 DM 的特征优化
+METHOD_OVERRIDES["dm_nodistill"] = deep_merge(
+    METHOD_OVERRIDES["dm"], {"distillation": {"updates_per_class": 0}})
 
 # lr / 分类权重扫描：只改在线阶段，不触发 Initial Base VAE 缓存失效
 for _name, _lr in {"g0_res_lr1e3": 1e-3,
@@ -320,7 +339,7 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
                     statistics, replay, cloud, learner, coreset, ledger,
                     rounds_log, edge_sec, peak_gpu, signature, wall_sec=0.0,
                     pending_vae=None, pending_rounds=None, reservoir=None,
-                    teacher=None):
+                    latent_reservoir=None, teacher=None):
     torch.save({
         "signature": signature, "vae": vae.state_dict(),
         "teacher": teacher.state_dict() if teacher is not None else None,
@@ -336,6 +355,8 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
         if coreset is not None else None,
         "reservoir": reservoir.state_dict()
         if reservoir is not None else None,
+        "latent_reservoir": latent_reservoir.state_dict()
+        if latent_reservoir is not None else None,
         "ledger": copy.deepcopy(ledger.entries),
         "rounds_log": copy.deepcopy(rounds_log),
         "edge_sec": float(edge_sec), "peak_gpu": float(peak_gpu),
@@ -347,8 +368,37 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
     }, path)
 
 
+def _save_diag_snapshot(path, *, round_idx, version, new_version, do_update,
+                        cfg, seed, tag, vae, protocol, memory, alignment,
+                        replay, cloud, learner, current_images,
+                        current_labels, cur_cls_f, cur_cls_y, rep_images,
+                        rep_labels, rep_feats_reenc, latent_reservoir=None):
+    """保存代表集更新前的完整状态（诊断用，不参与正常训练）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        "round": int(round_idx), "version": int(version),
+        "new_version": int(new_version), "do_update": bool(do_update),
+        "cfg": copy.deepcopy(cfg), "seed": int(seed), "tag": tag,
+        "vae": {k: v.detach().cpu().clone()
+                for k, v in vae.state_dict().items()},
+        "protocol_mean": protocol.mean.clone(),
+        "protocol_std": protocol.std.clone(),
+        "memory": memory.state_dict(), "alignment": alignment,
+        "replay": replay.state_dict(), "cloud": cloud.state_dict(),
+        "learner": learner.state_dict(),
+        "current_images": current_images.clone(),
+        "current_labels": current_labels.clone(),
+        "cur_cls_f": cur_cls_f.clone(), "cur_cls_y": cur_cls_y.clone(),
+        "rep_images": rep_images.clone(), "rep_labels": rep_labels.clone(),
+        "rep_feats_reenc": (None if rep_feats_reenc is None
+                            else rep_feats_reenc.clone()),
+        "latent_reservoir": (None if latent_reservoir is None
+                             else latent_reservoir.state_dict()),
+    }, path)
+
+
 def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
-               stop_after=None, stream=None):
+               stop_after=None, stream=None, snapshot_rounds=None):
     if method is not None and method not in METHOD_OVERRIDES:
         raise ValueError(f"未知方法 {method}; 可选: {sorted(METHOD_OVERRIDES)}")
     if method is not None:
@@ -432,6 +482,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     base = stream.base
     state_path = checkpoint_path(
         cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/stream_state.pt")
+    snapshot_set = set(int(r) for r in (snapshot_rounds or []))
     # 先探测断点：命中时跳过 base 训练、初始同步与初始云端训练
     st = None
     if resume and os.path.exists(state_path):
@@ -506,6 +557,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             reservoir = ClassBalancedReservoir.from_state_dict(st["reservoir"])
         else:
             reservoir = None
+        if distill == "reservoir_latent":
+            if st.get("latent_reservoir") is None:
+                raise ValueError("断点缺少 latent_reservoir 状态")
+            latent_reservoir = FeatureReservoir.from_state_dict(
+                st["latent_reservoir"])
+            reservoir_slots = FeatureReservoir.slots(memory.labels, C)
+        else:
+            latent_reservoir = None
+            reservoir_slots = None
         rounds_log = copy.deepcopy(st["rounds_log"])
         pending_vae = st.get("pending_vae")
         pending_rounds = [int(r) for r in (st.get("pending_rounds") or [])]
@@ -555,13 +615,21 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         coreset = None
         if distill == "kmeans":
+            # 初始质心由 Base 各类样本聚类得到，其“已见样本数”应从
+            # 平均簇大小起步，否则首个流式样本会以 lr=1 覆盖质心。
+            base_counts = np.bincount(np.asarray(base.labels), minlength=C)
+            init_counts = [max(1, int(round(int(n) / max(int(q), 1))))
+                           for n, q in zip(base_counts, quotas)]
             coreset = build_coreset(distill, memory.features, memory.labels,
-                                    quotas, dim=dim, seed=int(seed))
+                                    quotas, dim=dim, seed=int(seed),
+                                    initial_counts=init_counts)
 
         # Online Reservoir 基线：与代表集同预算的类平衡原始样本缓冲，
         # 初始内容取自 Initial Base Set，代表特征由当前 Encoder 精确重编码
         reservoir = None
-        if distill == "reservoir":
+        latent_reservoir = None
+        reservoir_slots = None
+        if distill in ("reservoir", "reservoir_latent"):
             reservoir = ClassBalancedReservoir(
                 budget, C, class_balanced=True, seed=int(seed) + 13)
             reservoir.caps = [int(q) for q in quotas]
@@ -572,8 +640,18 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 raise RuntimeError(
                     f"Reservoir 初始内容与代表集不一致: "
                     f"n={len(r_labels)} budget={budget}")
-            memory.features = protocol.normalize(
-                encode_mu(vae.encoder, r_imgs, device=device)).clone()
+            if distill == "reservoir_latent":
+                # 初始潜变量选取完成后即可丢掉原始图像缓冲
+                memory.features = protocol.normalize(
+                    encode_mu(vae.encoder, r_imgs, device=device)).clone()
+                base_seen = reservoir.seen.copy()
+                reservoir = None
+                latent_reservoir = FeatureReservoir(
+                    quotas, seed=int(seed) + 17, seen=base_seen)
+                reservoir_slots = FeatureReservoir.slots(memory.labels, C)
+            # 原始样本 Reservoir：初始同步沿用与其他方法相同的代表集初始化
+            # （memory.initialize_from_features），从首轮更新起才用缓冲重编码
+            # 覆盖，保证 r0 与其余方法逐位一致。
 
         cloud = CloudState.empty(budget, dim)
         learner = IncrementalCloudLearner(cfg, dim, C, device=device)
@@ -646,13 +724,31 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             signature=signature,
                             wall_sec=wall_sec + (time.time() - t_start),
                             pending_rounds=pending_rounds,
-                            reservoir=reservoir, teacher=teacher)
+                            reservoir=reservoir,
+                            latent_reservoir=latent_reservoir,
+                            teacher=teacher)
 
     # 统计来源（跨轮保持）：只有真正发生 reset 才降级，不因当前轮未更新而误标
     stats_origin = "aligned_full_history"
     if resuming and rounds_log:
         stats_origin = rounds_log[-1].get("stats_scope", stats_origin)
     ck = ckpt0
+    # 分类间隔分位数匹配（实验项）：lambda 首轮标定后跨轮固定
+    margin_enabled = (
+        distill == "dm"
+        and (bool(cfg["distillation"].get("margin_auto_lambda", False))
+             or float(cfg["distillation"].get("margin_weight", 0.0)) > 0))
+    margin_calib = {"value": None}
+
+    def _margin_kwargs():
+        if not margin_enabled:
+            return {}
+        return {"margin_head": MarginQuantileMatcher(
+                    vae.classifier, protocol.mean, protocol.std,
+                    memory.quotas, int(vae.latent_dim), int(vae.spatial_size),
+                    device=device),
+                "margin_lambda_state": margin_calib}
+
     for t in range(start_round, stream.num_rounds):
         if device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -802,6 +898,20 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 encode_mu(vae.encoder, rep_imgs, device=device))
         encode_sec = time.time() - te
 
+        if t in snapshot_set:
+            _save_diag_snapshot(
+                os.path.join(os.path.dirname(state_path),
+                             f"diag_snapshot_r{t}.pt"),
+                round_idx=t, version=version, new_version=new_version,
+                do_update=do_update, cfg=cfg, seed=seed, tag=tag, vae=vae,
+                protocol=protocol, memory=memory, alignment=alignment,
+                replay=replay, cloud=cloud, learner=learner,
+                current_images=current.images, current_labels=cur_labels,
+                cur_cls_f=cur_cls_f, cur_cls_y=cur_cls_y,
+                rep_images=rep_imgs, rep_labels=rep_labels,
+                rep_feats_reenc=rep_feats_reenc,
+                latent_reservoir=latent_reservoir)
+
         # ---------------- 统计记忆 ----------------
         ts = time.time()
         if not do_update:
@@ -876,7 +986,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
                 out = sdm.update(allowed_idx=opt_idx, round_idx=t,
-                                 real_features=all_f, real_labels=all_y)
+                                 real_features=all_f, real_labels=all_y,
+                                 **_margin_kwargs())
                 memory.features = out["features"]
                 distill_info = {**out["info"],
                                 "init": f"reencode_{init_method}",
@@ -906,7 +1017,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 out = sdm.update(allowed_idx=opt_idx, round_idx=t,
                                  real_features=real_f, real_labels=real_y,
                                  real_sources=real_src,
-                                 label_source=label_source)
+                                 label_source=label_source,
+                                 **_margin_kwargs())
                 memory.features = out["features"]
                 distill_info = {**out["info"], "target_scope": target_scope,
                                 "n_target": int(len(real_y))}
@@ -961,6 +1073,26 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                                 else "ground_truth"),
                                 "label_source": label_source,
                                 "provenance": reservoir.provenance()}
+            elif distill == "reservoir_latent":
+                # 只保留潜变量：历史特征已由 memory.align 对齐到当前版本，
+                # 不再用当前 Encoder 重编码；新样本按类平衡 reservoir 替换
+                if unlabeled:
+                    raise ValueError(
+                        "reservoir_latent 仅用于监督诊断协议")
+                idx, vals = latent_reservoir.offer(
+                    cur_cls_f.detach().cpu(), cur_cls_y.cpu(),
+                    reservoir_slots)
+                if len(idx) > 0:
+                    memory.features[idx] = vals
+                distill_info = {
+                    "method": "reservoir_latent",
+                    "n_buffer": int(len(memory.labels)),
+                    "per_class": latent_reservoir.per_class_counts(),
+                    "target_scope": "latent_reservoir_aligned",
+                    "balanced_by": "ground_truth",
+                    "n_replaced": int(latent_reservoir.total_replaced),
+                    "label_source": label_source,
+                    "provenance": latent_reservoir.provenance()}
             else:
                 raise ValueError(f"未知蒸馏方法: {distill}")
             memory.update_features(updated_idx, memory.features[updated_idx],
@@ -1154,7 +1286,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             wall_sec=wall_sec + (time.time() - t_start),
                             pending_vae=pending_vae,
                             pending_rounds=pending_rounds,
-                            reservoir=reservoir, teacher=teacher)
+                            reservoir=reservoir,
+                            latent_reservoir=latent_reservoir,
+                            teacher=teacher)
         if stop_after is not None and t >= int(stop_after):
             break
 

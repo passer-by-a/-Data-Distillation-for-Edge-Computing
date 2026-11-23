@@ -24,8 +24,6 @@ Thumbs.db
 *.tmp
 *.bak
 
-# ===== 生成缓存 / 旧代码（不入库）=====
+# ===== 生成缓存（不入库）=====
 vae_bdm/cache/
-legacy/
 .trae_tmp/
-diffusion_dldd/

@@ -644,3 +644,42 @@ def test_random_feature_dm_objective():
     assert torch.isfinite(out["features"]).all()
     assert not torch.allclose(out["features"], feats)
     assert all(not p.requires_grad for p in dm.feature_net.parameters())
+
+
+# ======================================================================
+# 28. FeatureReservoir：初始化时继承 Base 各类已见样本数
+# ======================================================================
+def test_feature_reservoir_inherits_base_seen():
+    from vae_streaming.memory.replay_buffer import FeatureReservoir
+
+    caps = [2, 3]
+    r = FeatureReservoir(caps, seed=0, seen=[100, 50])
+    assert r.seen.tolist() == [100, 50]
+    slots = [np.array([0, 1]), np.array([2, 3, 4])]
+    r.offer(torch.tensor([[0.1, 0.2]]), torch.tensor([0]), slots)
+    assert r.seen.tolist() == [101, 50]
+    restored = FeatureReservoir.from_state_dict(r.state_dict())
+    assert restored.seen.tolist() == [101, 50]
+    # 未显式传入 seen 时保留旧行为（seen = caps）
+    assert FeatureReservoir(caps).seen.tolist() == caps
+
+
+# ======================================================================
+# 29. 在线 K-means：初始质心继承平均簇大小，避免首样本 lr=1 覆盖
+# ======================================================================
+def test_online_kmeans_inherits_initial_cluster_counts():
+    from vae_streaming.distillation.online_coreset import OnlineKMeans
+
+    feats = torch.tensor([[0.0, 0.0], [10.0, 0.0],
+                          [0.0, 10.0], [10.0, 10.0]])
+    labels = torch.tensor([0, 0, 1, 1])
+    km = OnlineKMeans(feats, labels, [2, 2], dim=2, seed=0,
+                      initial_counts=[10, 10])
+    assert km.counts.tolist() == [10, 10]
+    km.update(torch.tensor([[1.0, 0.0]]), torch.tensor([0]))
+    assert km.counts.tolist() == [11, 10]
+    # lr = 1/11，质心只移动 1/11，而不是被单个样本整体覆盖
+    assert torch.allclose(km.features[0], torch.tensor([1.0 / 11.0, 0.0]),
+                          atol=1e-6)
+    restored = OnlineKMeans.from_state_dict(km.state_dict())
+    assert restored.counts.tolist() == [11, 10]

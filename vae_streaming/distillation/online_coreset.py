@@ -58,9 +58,19 @@ class _BaseCoreset:
 class OnlineKMeans(_BaseCoreset):
     """Sculley 流式 k-means: 代表特征是逐类质心（与静态 K-means 口径一致）。"""
 
-    def __init__(self, features, labels, quotas, dim=1024, seed=0):
+    def __init__(self, features, labels, quotas, dim=1024, seed=0,
+                 initial_counts=None):
         super().__init__(features, labels, quotas, dim, seed)
-        self.counts = np.zeros(self.num_classes, dtype=np.int64)
+        # 初始质心聚合了多个 Base 样本，计数必须继承其平均簇大小；
+        # 若从 0 开始，首个流式样本会以 lr=1 直接覆盖质心。
+        if initial_counts is None:
+            self.counts = np.ones(self.num_classes, dtype=np.int64)
+        else:
+            counts = np.asarray(initial_counts, dtype=np.int64)
+            if counts.shape != (self.num_classes,):
+                raise ValueError(
+                    f"initial_counts 需为 {self.num_classes} 维")
+            self.counts = np.maximum(counts, 1)
 
     def align(self, alignment):
         super().align(alignment)
@@ -111,7 +121,9 @@ class OnlineKMeans(_BaseCoreset):
         return obj
 
 
-def build_coreset(kind, features, labels, quotas, dim=1024, seed=0):
+def build_coreset(kind, features, labels, quotas, dim=1024, seed=0,
+                  initial_counts=None):
     if kind == "kmeans":
-        return OnlineKMeans(features, labels, quotas, dim, seed)
+        return OnlineKMeans(features, labels, quotas, dim, seed,
+                            initial_counts=initial_counts)
     raise ValueError(f"未知 coreset: {kind}")

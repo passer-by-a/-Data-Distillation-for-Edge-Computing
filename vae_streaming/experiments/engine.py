@@ -185,6 +185,50 @@ for _name, _base in {"kmeans_g5": "online_kmeans",
         {"vae": {"online_lr": 3e-4, "online_cls_lambda": 0.2}})
 
 
+# 方法身份键：这些值由方法名定义（如 dm_freeze 必须关闭边缘更新），
+# 始终以预设为准；其余键（如 kip_steps / kip_ridge / replay_ratio）作为
+# 默认值，配置文件中显式给出的值优先，便于在不改方法名的情况下调参。
+_PRESET_IDENTITY = (
+    ("distillation", "method"),
+    ("distillation", "feature_type"),
+    ("distillation", "num_mappings"),
+    ("distillation", "exact_target"),
+    ("distillation", "update_fraction"),
+    ("distillation", "updates_per_class"),
+    ("distillation", "margin_auto_lambda"),
+    ("distillation", "margin_grad_ratio"),
+    ("distillation", "lambda_latent"),
+    ("alignment", "method"),
+    ("communication", "mode"),
+    ("vae", "online_update"),
+    ("vae", "online_lr"),
+    ("vae", "online_cls_lambda"),
+)
+
+
+def _pick_paths(src, paths):
+    """从 src 中按嵌套路径抽取子字典"""
+    out = {}
+    for path in paths:
+        node = src
+        for key in path[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+        if not isinstance(node, dict) or path[-1] not in node:
+            continue
+        cur = out
+        for key in path[:-1]:
+            cur = cur.setdefault(key, {})
+        cur[path[-1]] = copy.deepcopy(node[path[-1]])
+    return out
+
+
+def _apply_method_preset(cfg, method):
+    """预设作为默认值合并：配置显式值优先，方法身份键强制取预设"""
+    preset = METHOD_OVERRIDES[method]
+    merged = deep_merge(preset, cfg)
+    return deep_merge(merged, _pick_paths(preset, _PRESET_IDENTITY))
+
+
 def _make_cloud_learner(cfg, dim, num_classes, device):
     """多分支在线配对实验：一份边缘轨迹驱动四个云端分类器"""
     if bool(cfg["cloud"].get("multi_branch", False)):
@@ -427,7 +471,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     if method is not None and method not in METHOD_OVERRIDES:
         raise ValueError(f"未知方法 {method}; 可选: {sorted(METHOD_OVERRIDES)}")
     if method is not None:
-        cfg = deep_merge(cfg, METHOD_OVERRIDES[method])
+        cfg = _apply_method_preset(cfg, method)
         tag = method
     else:
         cfg = copy.deepcopy(cfg)
@@ -488,9 +532,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 "无标签 DM 的匹配目标必须包含 Base Replay 的真实特征，"
                 "请设置 distillation.exact_target=True")
     select_best_on_val = bool(cfg["cloud"].get("select_best_on_val", True))
-    multi_branch = bool(cfg["cloud"].get("multi_branch", False))
-    # 多分支实验需要逐轮验证指标，但验证集只用于评估，不参与轮内选优
-    need_val_feats = select_best_on_val or multi_branch
+    # 轮末评估与轮内选优解耦：验证特征每轮都编码，但只在训练结束后评估
+    # 最终权重并写入 val_acc/val_f1，不参与任何模型选择或早停。
+    eval_val_each_round = bool(cfg.get("evaluation", {}).get(
+        "val_each_round", True))
     # DM 精确目标：每轮都用当前 encoder 重编码 replay+current 作为同一目标集合
     dm_exact = distill == "dm" and bool(
         cfg["distillation"].get("exact_target", False))
@@ -528,6 +573,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         st = torch.load(state_path, map_location="cpu", weights_only=False)
         if st["signature"] != signature:
             raise ValueError("断点状态与当前配置签名不一致，拒绝续跑")
+        # 配置签名不含数据流实现：必须再核对首轮记录的数据流指纹，
+        # 否则数据流构建逻辑变更后会静默拼接两条流。
+        saved_stream_sha1 = (st.get("rounds_log") or [{}])[0].get("stream_sha1")
+        current_stream_sha1 = stream.stream_indices_sha1()
+        if saved_stream_sha1 is not None and \
+                saved_stream_sha1 != current_stream_sha1:
+            raise ValueError(
+                f"断点数据流指纹 {saved_stream_sha1} 与当前数据流 "
+                f"{current_stream_sha1} 不一致，拒绝续跑；请换新 tag 从 Base 重跑")
     resuming = st is not None
 
     vae = build_vae(C, int(cfg["latent_dim"]), int(cfg["base_channels"]),
@@ -712,7 +766,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         val_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if need_val_feats else None
+            if eval_val_each_round else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
         cloud_init = learner.update(cloud.features, cloud.labels,
@@ -721,6 +775,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                     else None, round_idx=-1,
                                     mode=cloud_mode)
         init_metrics = learner.evaluate(test_feats, stream.test_labels)
+        init_val = (learner.evaluate(val_feats, stream.val_labels)
+                    if val_feats is not None else None)
         init_branches = None
         if hasattr(learner, "evaluate_branches"):
             init_branches = learner.evaluate_branches(
@@ -739,8 +795,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "cloud": cloud_init,
             "cloud_param_sha1": _module_sha1(learner.model),
             "acc": init_metrics["acc"], "f1": init_metrics["f1"],
-            "val_acc": (init_branches["inc200"]["val"]["acc"]
-                        if init_branches else None),
+            "val_acc": init_val["acc"] if init_val else None,
+            "val_f1": init_val["f1"] if init_val else None,
             "cloud_branches": init_branches,
             "sync_bytes": size,
             "sync_verify": init_verify,
@@ -1224,7 +1280,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # 无标签协议关闭基于独立验证集的逐轮模型选择，只做固定步数训练
         val_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if need_val_feats else None
+            if eval_val_each_round else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
         eval_encode_sec = time.time() - te
@@ -1234,6 +1290,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                     else None, round_idx=t,
                                     mode=cloud_mode)
         met = learner.evaluate(test_feats, stream.test_labels)
+        # 轮末评估（只读）：用训练结束后的最终权重评估验证集，不参与选优
+        val_met = (learner.evaluate(val_feats, stream.val_labels)
+                   if val_feats is not None else None)
 
         # 历史域 / 当前域
         group_metrics = {}
@@ -1338,6 +1397,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "cloud": cloud_info,
             "cloud_branches": cloud_branches,
             "acc": met["acc"], "f1": met["f1"],
+            "val_acc": val_met["acc"] if val_met else None,
+            "val_f1": val_met["f1"] if val_met else None,
             "groups": group_metrics,
             "test_int8_acc": test_int8,
             "test_int8_sec": int8_sec,
@@ -1362,12 +1423,14 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                            stream)
 
         if verbose:
+            val_txt = (f"{rec['val_acc']:.2f}"
+                       if rec["val_acc"] is not None else "n/a")
             print(f"  r{t} v{new_version} acc {met['acc']:.2f} "
                   f"f1 {met['f1']:.2f} | drift {anchor_drift['relative']:.4f} "
                   f"align {alignment.relative_err:.4f} | "
                   f"stats n={stats.n_seen} | {sync_mode} "
                   f"{size['theoretical_bytes']/1024:.1f}KB | "
-                  f"cloud val {cloud_info['best_val_acc']} | {rec['round_sec']:.1f}s",
+                  f"cloud val {val_txt} | {rec['round_sec']:.1f}s",
                   flush=True)
         version = new_version
         if save:

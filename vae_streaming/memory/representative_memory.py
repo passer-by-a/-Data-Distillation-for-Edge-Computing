@@ -28,8 +28,9 @@ def _select_class(z, q, method, seed, cfg):
     if method == "kmeans":
         km = KMeans(n_clusters=q, random_state=seed, n_init=1, max_iter=100)
         km.fit(z.numpy())
-        # 空簇回退为 1，避免后续 1/count 无定义
-        sizes = np.maximum(np.bincount(km.labels_, minlength=q), 1)
+        # 保留真实簇大小：空簇记为 0，由下游按空槽处理（ExStream 优先填空槽，
+        # Online K-means 的 1/count 学习率在内部对 0 取 max(·,1)）。
+        sizes = np.bincount(km.labels_, minlength=q)
         return (torch.from_numpy(km.cluster_centers_).float(),
                 sizes.astype(np.int64))
     raise ValueError(f"未知初始化方法: {method}")

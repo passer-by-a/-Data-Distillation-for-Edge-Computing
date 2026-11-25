@@ -492,7 +492,7 @@ def test_label_shift_stream():
 # ======================================================================
 def test_full_pipeline_resume(tmp_path):
     from vae_streaming.config_utils import load_config
-    from vae_streaming.experiments.engine import run_method
+    from vae_streaming.experiments.engine import _build_stream, run_method
 
     cfg = load_config("vae_streaming/configs/cifar10.yaml")
     cfg["stream"]["initial_fraction"] = 0.10
@@ -511,15 +511,39 @@ def test_full_pipeline_resume(tmp_path):
     full = run_method(cfg, **kw)
     partial = run_method(cfg, stop_after=0, **kw)
     assert len(partial["rounds"]) == 2
+
+    # 续跑必须同时核对数据流指纹：仅配置签名相同不能证明是同一条流
+    class _TamperedStream:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def stream_indices_sha1(self):
+            return "tampered-" + self._inner.stream_indices_sha1()
+
+    with pytest.raises(ValueError, match="数据流指纹"):
+        run_method(cfg, resume=True, stream=_TamperedStream(_build_stream(cfg)),
+                   **kw)
+
     resumed = run_method(cfg, resume=True, **kw)
     assert len(full["rounds"]) == len(resumed["rounds"]) == 3
     for a, b in zip(full["rounds"], resumed["rounds"]):
         assert a["round"] == b["round"]
         assert a["acc"] == pytest.approx(b["acc"], abs=1e-6)
         assert a["f1"] == pytest.approx(b["f1"], abs=1e-6)
+        assert a["val_acc"] == pytest.approx(b["val_acc"], abs=1e-6)
         assert a["statistics"]["n_seen"] == b["statistics"]["n_seen"]
     assert (full["communication"]["cumulative_upload_bytes"] ==
             resumed["communication"]["cumulative_upload_bytes"])
+    # 轮末评估与轮内选优解耦：每轮都有云端 val 指标，select_best_on_val
+    # 仍为 False，best_val_acc 必须为空
+    assert cfg["cloud"]["select_best_on_val"] is False
+    for rec in resumed["rounds"]:
+        assert rec["val_acc"] is not None and 0.0 <= rec["val_acc"] <= 100.0
+        assert rec["val_f1"] is not None
+        assert rec["cloud"]["best_val_acc"] is None
 
 
 # ======================================================================
@@ -811,6 +835,32 @@ def test_exstream_single_slot_absorbs_instead_of_self_merge():
 
 
 # ======================================================================
+# 30b. Base k-means 空簇必须保留真实零计数（不能虚增类内样本数）
+# ======================================================================
+def test_empty_kmeans_cluster_keeps_zero_count():
+    from vae_streaming.distillation.online_coreset import ExStreamCoreset
+    from vae_streaming.memory.representative_memory import \
+        initialize_representatives
+
+    # 6 个样本只有 2 个不同特征值，却要求 3 个代表 → 必然出现空簇
+    feats = torch.tensor([[0.0, 0.0]] * 3 + [[1.0, 1.0]] * 3)
+    labels = torch.zeros(6, dtype=torch.long)
+    reps, rep_y, counts = initialize_representatives(
+        feats, labels, [3], method="kmeans", seed=0)
+    assert int(counts.sum()) == 6, counts.tolist()
+    assert int(counts.min()) == 0, counts.tolist()
+
+    ex = ExStreamCoreset(reps, rep_y, [3], dim=2, seed=0,
+                         initial_counts=counts)
+    out = ex.update(torch.tensor([[2.0, 2.0]]),
+                    torch.zeros(1, dtype=torch.long))
+    # 新样本应填进空槽而不是触发合并，累计计数等于真实样本数
+    assert out["info"]["n_inserted"] == 1
+    assert out["info"]["n_merged"] == 0
+    assert int(ex.counts.sum()) == 7
+
+
+# ======================================================================
 # 31. KIP：核回归损失下降，未授权位置严格保持不变
 # ======================================================================
 def test_kip_reduces_loss_and_holds_unallowed_rows():
@@ -850,6 +900,36 @@ def test_kip_bandwidth_samples_across_ordered_classes():
     sigma2 = _median_sqdist(a, b, max_n=30)
     # 前缀采样只会看到原点附近（median=0）；等距跨步覆盖三簇后应显著大于 0
     assert sigma2 > 10.0
+
+
+# ======================================================================
+# 31b. 方法预设只提供默认值：显式配置可调超参，但方法身份键不可覆盖
+# ======================================================================
+def test_method_preset_defaults_respect_explicit_config():
+    from vae_streaming.config_utils import load_config
+    from vae_streaming.experiments.engine import _apply_method_preset
+
+    cfg = load_config(
+        "vae_streaming/configs/cifar10_supervised_multi80_u2.yaml")
+    cfg["distillation"]["kip_steps"] = 3
+    cfg["distillation"]["kip_ridge"] = 0.1
+    merged = _apply_method_preset(cfg, "kip")
+    assert merged["distillation"]["kip_steps"] == 3
+    assert merged["distillation"]["kip_ridge"] == 0.1
+    # 未显式给出的键仍取预设默认值
+    assert merged["distillation"]["kip_lr"] == 0.01
+    assert merged["distillation"]["kip_bandwidth_mult"] == 1.0
+
+    # 方法身份键由预设强制：--methods 不能被配置里的默认方法/对齐覆盖
+    cfg2 = load_config(
+        "vae_streaming/configs/cifar10_supervised_multi80_u2.yaml")
+    assert _apply_method_preset(cfg2, "kip")["distillation"]["method"] == "kip"
+    assert _apply_method_preset(
+        cfg2, "dm_r392base")["alignment"]["method"] == "reencode"
+    assert _apply_method_preset(
+        cfg2, "dm_freeze")["vae"]["online_update"] is False
+    assert _apply_method_preset(
+        cfg2, "dm_nodistill")["distillation"]["updates_per_class"] == 0
 
 
 # ======================================================================

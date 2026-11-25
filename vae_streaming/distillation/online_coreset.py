@@ -30,9 +30,6 @@ class _BaseCoreset:
     def update(self, features, labels, round_idx=0, allowed_idx=None):
         raise NotImplementedError
 
-    def get_features(self):
-        return self.features
-
     def _allowed_mask(self, allowed_idx):
         if allowed_idx is None:
             return None

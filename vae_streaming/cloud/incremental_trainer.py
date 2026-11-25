@@ -6,7 +6,6 @@
 云端只读取已同步的代表特征；不访问边缘原始图像、未来轮次或测试集标签。
 """
 import copy
-import math
 import time
 
 import torch

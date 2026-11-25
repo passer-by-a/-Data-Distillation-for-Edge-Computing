@@ -25,7 +25,7 @@ from ..communication.payload_accounting import (CommunicationLedger,
                                                 build_sync_message,
                                                 message_size,
                                                 select_patch_indices)
-from ..communication.quantization import decode_features, encode_features
+from ..communication.quantization import decode_features
 from ..data.causal_stream import CausalStream, regroup_stream_rounds
 from ..distillation.kip import KIPDistiller
 from ..distillation.margin_matching import MarginQuantileMatcher

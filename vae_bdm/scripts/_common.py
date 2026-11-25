@@ -11,7 +11,6 @@ for p in (ROOT, PKG):
         sys.path.insert(0, p)
 
 from vae_bdm.config_utils import ensure_dirs, load_config  # noqa: E402
-from vae_bdm.features import load_features  # noqa: E402
 
 
 def load_cfg(name):

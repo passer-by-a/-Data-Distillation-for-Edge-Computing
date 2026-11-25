@@ -10,7 +10,6 @@ import torch
 from .baselines import allocate_quotas, build_baseline
 from .bdm import BatchDM
 from .cloud import evaluate_cloud_classifier, train_cloud_classifier
-from .config_utils import result_path
 from .quant import payload_table, quantize_pair, save_payload
 
 

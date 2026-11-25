@@ -317,13 +317,3 @@ def evaluate_vae(vae, images, labels, cfg, batch=256, device="cuda"):
         n += x.size(0)
     return {"rec": rec_all / max(1, n), "kl": kl_all / max(1, n),
             "cls_acc": 100.0 * correct / max(1, n), "n": int(n)}
-
-
-def encoder_delta(vae, prev_encoder):
-    """当前 Encoder 参数相对上一轮快照的 L2 变化"""
-    total, count = 0.0, 0
-    for (name, p), (_, q) in zip(vae.encoder.named_parameters(),
-                                 prev_encoder.state_dict().items()):
-        total += float((p.detach().cpu() - q).pow(2).sum())
-        count += p.numel()
-    return float((total / max(1, count)) ** 0.5)

@@ -3,7 +3,6 @@
 对应任务书第十二节 Test 1–Test 5。运行:
   python -m pytest vae_streaming/tests/test_label_protocol.py -q
 """
-import copy
 import json
 import os
 
@@ -14,10 +13,8 @@ import torch
 from vae_streaming.config_utils import load_config
 from vae_streaming.data.causal_stream import (CausalStream, LabeledBatch,
                                               UnlabeledBatch)
-from vae_streaming.experiments.engine import (_build_stream, _encoder_sha1,
-                                              _module_sha1, _tensor_sha1,
-                                              run_method)
-from vae_streaming.models.online_vae import build_vae, encode_mu
+from vae_streaming.experiments.engine import _build_stream, run_method
+from vae_streaming.models.online_vae import build_vae
 from vae_streaming.models.pseudo_labeler import PSEUDO_SOURCE, FixedTeacher
 
 

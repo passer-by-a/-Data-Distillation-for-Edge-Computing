@@ -47,10 +47,6 @@ class FeatureAlignment:
         """旧版本特征 → 新版本特征"""
         return z.float() * self.scale + self.bias
 
-    def apply_stats(self, mean, var):
-        """μ_t ≈ a⊙μ_{t-1}+b, v_t ≈ a²⊙v_{t-1}（近似，需标记 estimated）"""
-        return mean.float() * self.scale + self.bias, var.float() * self.scale.pow(2)
-
     def to_arrays(self):
         return {"scale": self.scale.numpy().astype(np.float32),
                 "bias": self.bias.numpy().astype(np.float32)}
@@ -78,41 +74,6 @@ class FeatureAlignment:
                 "n_classes_center_fit": int(self.n_classes_center_fit),
                 "n_classes_center_heldout": int(self.n_classes_center_heldout),
                 "estimated": bool(self.estimated)}
-
-    @classmethod
-    def from_meta(cls, scale, bias, meta):
-        scale = torch.as_tensor(np.asarray(scale), dtype=torch.float32)
-        bias = torch.as_tensor(np.asarray(bias), dtype=torch.float32)
-        return cls(method=meta.get("method", "diagonal_affine"),
-                   scale=scale, bias=bias, dim=int(scale.numel()),
-                   version_from=int(meta["version_from"]),
-                   version_to=int(meta["version_to"]),
-                   n_anchors=int(meta.get("n_anchors", 0)),
-                   n_fit=int(meta.get("n_fit", 0)),
-                   n_heldout=int(meta.get("n_heldout", 0)),
-                   fit_mse=float(meta.get("fit_mse", 0.0)),
-                   heldout_mse=float(meta.get("heldout_mse", 0.0)),
-                   relative_err=float(meta.get("relative_err", 0.0)),
-                   no_align_heldout_mse=float(
-                       meta.get("no_align_heldout_mse", 0.0)),
-                   no_align_relative_err=float(
-                       meta.get("no_align_relative_err", 0.0)),
-                   improvement_heldout=float(
-                       meta.get("improvement_heldout", 0.0)),
-                   max_scale=float(meta.get("max_scale", 3.0)),
-                   clamped_frac=float(meta.get("clamped_frac", 0.0)),
-                   class_center_err=float(meta.get("class_center_err", float("nan"))),
-                   fit_class_center_err=float(meta.get("fit_class_center_err",
-                                                       float("nan"))),
-                   no_align_class_center_err=float(
-                       meta.get("no_align_class_center_err", float("nan"))),
-                   class_center_improvement=float(
-                       meta.get("class_center_improvement", float("nan"))),
-                   n_classes_center_fit=int(meta.get("n_classes_center_fit", 0)),
-                   n_classes_center_heldout=int(
-                       meta.get("n_classes_center_heldout", 0)),
-                   estimated=bool(meta.get("estimated", True)))
-
 
 def identity_alignment(dim, version_from, version_to):
     return FeatureAlignment(method="none", scale=torch.ones(dim),

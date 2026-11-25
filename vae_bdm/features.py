@@ -153,8 +153,6 @@ def extract_vae_features(images, cfg):
     """[B,3,32,32] 原始图像（[-1,1]）→ [B,1024]"""
     bb = VAEBackbone(cfg["num_classes"], DEV, cfg["vae_ckpt"])
     d = cache_dir(cfg)
-    with open(os.path.join(d, "metadata.json")) as f:
-        meta = json.load(f)
     raw = _encode(bb.ae.encode_mu, images, cfg["feature"]["batch"])
     # 复用训练集统计量: 从 npy 训练特征反推不可行，直接重新计算并缓存
     # 首次调用时由 extract_and_cache 保证 metadata 与 npy 一致；此处用

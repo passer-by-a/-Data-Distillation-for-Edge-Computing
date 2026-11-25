@@ -15,7 +15,6 @@
 """
 import argparse
 import copy
-import hashlib
 import json
 
 import numpy as np
@@ -27,16 +26,8 @@ from vae_bdm.quant import Quantizer
 
 from ..cloud.incremental_trainer import IncrementalCloudLearner
 from ..config_utils import checkpoint_path, load_config, result_path
-from ..experiments.engine import _build_stream
+from ..experiments.engine import _build_stream, _module_sha1
 from ..models.online_vae import FeatureProtocol, build_vae, encode_mu
-
-
-def _module_sha1(module):
-    h = hashlib.sha1()
-    for k, v in sorted(module.state_dict().items()):
-        h.update(k.encode())
-        h.update(v.detach().cpu().contiguous().numpy().tobytes())
-    return h.hexdigest()[:16]
 
 
 def _encode(vae, protocol, images, device):

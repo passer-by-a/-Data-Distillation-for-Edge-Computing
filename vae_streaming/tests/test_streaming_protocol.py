@@ -14,7 +14,7 @@ import torch
 from vae import EdgeVAE
 from vae_bdm.baselines import allocate_quotas
 from vae_streaming.cloud.incremental_trainer import IncrementalCloudLearner
-from vae_streaming.cloud.state_sync import CloudState, apply_sync_message
+from vae_streaming.cloud.state_sync import CloudState
 from vae_streaming.communication.payload_accounting import (CommunicationLedger,
                                                             build_sync_message,
                                                             message_size,

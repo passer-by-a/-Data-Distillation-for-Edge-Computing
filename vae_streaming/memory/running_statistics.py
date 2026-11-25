@@ -127,9 +127,6 @@ class StreamingStatistics:
         return {c: (self.mean[c].float(), (self.M2[c] / self.count[c]).float())
                 for c in range(self.num_classes) if self.count[c] > 0}
 
-    def has_class(self, c):
-        return self.count[c] > 0
-
     @property
     def n_seen(self):
         return int(self.count.sum())

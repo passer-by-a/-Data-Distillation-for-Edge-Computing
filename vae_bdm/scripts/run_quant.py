@@ -1,6 +1,5 @@
 """Step 6: FP32/FP16/INT8 量化与真实 payload"""
 import argparse
-import json
 import os
 
 from vae_bdm.scripts._common import load_cfg

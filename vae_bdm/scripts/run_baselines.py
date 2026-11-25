@@ -1,7 +1,6 @@
 """Step 2: Full / Random / K-means / K-means + Moment 基线"""
 import argparse
 import csv
-import json
 import os
 
 from vae_bdm.scripts._common import load_cfg

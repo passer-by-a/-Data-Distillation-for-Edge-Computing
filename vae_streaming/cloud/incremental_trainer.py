@@ -6,6 +6,7 @@
 云端只读取已同步的代表特征；不访问边缘原始图像、未来轮次或测试集标签。
 """
 import copy
+import math
 import time
 
 import torch
@@ -26,6 +27,8 @@ class IncrementalCloudLearner:
         self.wd = float(self.cfg.get("wd", 1e-4))
         self.batch = int(self.cfg.get("batch", 256))
         self.steps_per_round = int(self.cfg.get("steps_per_round", 200))
+        # >0 时按"每轮固定 epoch 数"训练，步数随当前同步集大小自动换算
+        self.epochs_per_round = int(self.cfg.get("epochs_per_round", 0))
         self.model = None
         self.opt = None
         self.steps_done = 0
@@ -82,13 +85,24 @@ class IncrementalCloudLearner:
             if self.device.type == "cuda":
                 torch.cuda.manual_seed_all(self.seed + 104729 * int(round_idx))
 
-            steps = self.steps_per_round
+            g = torch.Generator().manual_seed(self.seed + 7919 * int(round_idx))
+            batches = None
+            if self.epochs_per_round > 0:
+                # 固定 5 个 epoch：每轮完整遍历当前同步集，最后不足一个
+                # batch 的尾批也参与更新
+                batches = []
+                for _ in range(self.epochs_per_round):
+                    perm = torch.randperm(len(x), generator=g)
+                    for i in range(0, len(x), self.batch):
+                        batches.append(perm[i:i + self.batch])
+                steps = len(batches)
+            else:
+                steps = self.steps_per_round
             # 重置学习率调度（余弦退火到 0），但保留模型与优化器状态
             for pg in self.opt.param_groups:
                 pg["lr"] = self.lr
             sch = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt,
                                                              max(1, steps))
-            g = torch.Generator().manual_seed(self.seed + 7919 * int(round_idx))
             best_acc, best_state, best_step = -1.0, None, 0
             t0 = time.time()
             val_every = max(1, steps // 5)
@@ -111,8 +125,11 @@ class IncrementalCloudLearner:
 
             self.model.train()
             for step in range(1, steps + 1):
-                idx = torch.randint(0, len(x), (min(self.batch, len(x)),),
-                                    generator=g)
+                if batches is None:
+                    idx = torch.randint(0, len(x), (min(self.batch, len(x)),),
+                                        generator=g)
+                else:
+                    idx = batches[step - 1]
                 xb = x[idx].to(self.device)
                 yb = y[idx].to(self.device)
                 loss = F.cross_entropy(self.model(xb), yb)
@@ -137,7 +154,9 @@ class IncrementalCloudLearner:
         self.round = int(round_idx)
         info = {"mode": mode, "round": int(round_idx),
                 "n_train": int(len(x)),
-                "steps": int(steps), "train_sec": sec,
+                "steps": int(steps),
+                "epochs_per_round": int(self.epochs_per_round),
+                "train_sec": sec,
                 "total_train_sec": self.total_train_sec,
                 "best_val_acc": None if best_acc < 0 else float(best_acc),
                 "best_step": int(best_step),

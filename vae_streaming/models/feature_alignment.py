@@ -120,6 +120,23 @@ def identity_alignment(dim, version_from, version_to):
                             version_to=version_to, dim=dim)
 
 
+def _per_class_fit_mask(labels):
+    """在每个类别内部交替划分拟合锚点（True）与留出锚点（False）。
+
+    labels 通常按类别连续排列；直接在类内取偶数位置，保证每个类（只要
+    ≥2 个锚点）同时进入拟合与留出，避免"只用前一半类拟合"。
+    """
+    labels = torch.as_tensor(labels).long().flatten()
+    mask = torch.zeros(len(labels), dtype=torch.bool)
+    for c in torch.unique(labels).tolist():
+        idx_c = torch.nonzero(labels == c, as_tuple=False).flatten()
+        if len(idx_c) == 1:
+            mask[idx_c[0]] = True
+        else:
+            mask[idx_c[::2]] = True
+    return mask
+
+
 def estimate_feature_alignment(prev_encoder, current_encoder, anchor_images,
                                anchor_labels=None, version_from=0,
                                version_to=1, max_scale=3.0,
@@ -150,9 +167,25 @@ def estimate_feature_alignment(prev_encoder, current_encoder, anchor_images,
         al.estimated = True
         return al
 
-    n_fit = n // 2
-    zo, zn = z_old[:n_fit], z_new[:n_fit]
-    zo_h, zn_h = z_old[n_fit:], z_new[n_fit:]
+    # 锚点由 _stratified_anchor_indices 按类别连续拼接；若直接取前一半，
+    # CIFAR-10 只用类 0–4 拟合、CIFAR-100 只用类 0–49 拟合，变换却作用于
+    # 所有类。这里在每个类内部交替划分 fit / heldout。
+    y_all = None
+    if anchor_labels is not None:
+        y_all = torch.as_tensor(np.asarray(anchor_labels)).long().flatten()
+        if len(y_all) != n:
+            raise ValueError(f"anchor_labels 长度 {len(y_all)} != 锚点数 {n}")
+        fit_mask = _per_class_fit_mask(y_all)
+    else:
+        fit_mask = torch.zeros(n, dtype=torch.bool)
+        fit_mask[: n // 2] = True
+    if not bool(fit_mask.any()) or bool(fit_mask.all()):
+        # 每类只有 1 个锚点时无法类内划分，退回简单对半切
+        fit_mask = torch.zeros(n, dtype=torch.bool)
+        fit_mask[: n // 2] = True
+    n_fit = int(fit_mask.sum())
+    zo, zn = z_old[fit_mask], z_new[fit_mask]
+    zo_h, zn_h = z_old[~fit_mask], z_new[~fit_mask]
 
     mo, mn = zo.mean(0), zn.mean(0)
     var_o = zo.var(0, unbiased=False).clamp_min(1e-8)
@@ -192,11 +225,11 @@ def estimate_feature_alignment(prev_encoder, current_encoder, anchor_images,
             errs.append(e)
         return (float(np.mean(errs)) if errs else float("nan")), len(errs), per
 
-    if anchor_labels is not None:
-        y = torch.as_tensor(np.asarray(anchor_labels))
-        fit_class_err, n_fit_cls, _ = _center_err(zo, zn, y[:n_fit])
-        class_err, n_held_cls, per_class = _center_err(zo_h, zn_h, y[n_fit:])
-        no_align_class_err, _, _ = _center_err(zo_h, zn_h, y[n_fit:],
+    if y_all is not None:
+        fit_class_err, n_fit_cls, _ = _center_err(zo, zn, y_all[fit_mask])
+        class_err, n_held_cls, per_class = _center_err(
+            zo_h, zn_h, y_all[~fit_mask])
+        no_align_class_err, _, _ = _center_err(zo_h, zn_h, y_all[~fit_mask],
                                                apply=False)
         if np.isfinite(no_align_class_err) and no_align_class_err > 0:
             class_improvement = 1.0 - class_err / no_align_class_err

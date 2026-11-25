@@ -165,24 +165,35 @@ class CausalStream:
                             for idx in self.class_indices]
 
         self.base_indices = np.sort(np.concatenate(self.base_indices))
-        sizes = np.array([len(x) for x in rest_indices], dtype=np.int64)
-        weights = round_weights(self.num_classes, self.num_rounds,
-                                self.scenario, seed=self.seed)
-        alloc = allocate_round_counts(sizes, self.num_rounds, weights)
-        self.round_class_counts = alloc
 
-        self.round_indices = []
-        cursor = [0] * self.num_classes
-        for r in range(self.num_rounds):
-            parts = []
+        if self.class_quota is None and self.scenario in ("iid", "covariate_shift"):
+            # IID 下所有类的小数配额相同，按固定类顺序补足名额会让低编号类
+            # 每轮多拿 1 张，末期提前耗尽（CIFAR-100 r79 只剩类 90–99）。
+            # 改为：保留 base，剩余样本固定种子整体打乱一次后等分各轮。
+            rest = np.concatenate(rest_indices)
+            self.round_indices = self._even_round_split(rest, rng)
+            self.round_class_counts = np.stack([
+                np.bincount(labels[idx], minlength=self.num_classes)
+                for idx in self.round_indices])
+        else:
+            sizes = np.array([len(x) for x in rest_indices], dtype=np.int64)
+            weights = round_weights(self.num_classes, self.num_rounds,
+                                    self.scenario, seed=self.seed)
+            alloc = allocate_round_counts(sizes, self.num_rounds, weights)
+            self.round_class_counts = alloc
+
+            self.round_indices = []
+            cursor = [0] * self.num_classes
+            for r in range(self.num_rounds):
+                parts = []
+                for c in range(self.num_classes):
+                    k = int(alloc[r, c])
+                    if k:
+                        parts.append(rest_indices[c][cursor[c]:cursor[c] + k])
+                        cursor[c] += k
+                self.round_indices.append(np.sort(np.concatenate(parts)))
             for c in range(self.num_classes):
-                k = int(alloc[r, c])
-                if k:
-                    parts.append(rest_indices[c][cursor[c]:cursor[c] + k])
-                    cursor[c] += k
-            self.round_indices.append(np.sort(np.concatenate(parts)))
-        for c in range(self.num_classes):
-            assert cursor[c] == len(rest_indices[c]), "类别剩余样本未耗尽"
+                assert cursor[c] == len(rest_indices[c]), "类别剩余样本未耗尽"
 
         all_stream = np.concatenate(self.round_indices)
         assert len(all_stream) == len(set(all_stream.tolist())), "轮次间存在重复样本"
@@ -195,6 +206,23 @@ class CausalStream:
             if self.scenario == "label_shift" else []
 
         self._rest_indices = rest_indices
+
+    def _even_round_split(self, rest, rng):
+        """固定种子整体打乱剩余索引后等分为 num_rounds 轮。
+
+        正式协议 39200 = 80 × 490（rem=0）；余数只在非整除的小配置下出现，
+        平摊到前 rem 轮，保证总量与顺序不变。
+        """
+        stream_order = rest[rng.permutation(len(rest))]
+        per = len(stream_order) // self.num_rounds
+        rem = len(stream_order) - per * self.num_rounds
+        sizes = [per + (1 if i < rem else 0) for i in range(self.num_rounds)]
+        rounds, cursor = [], 0
+        for k in sizes:
+            rounds.append(stream_order[cursor:cursor + k].copy())
+            cursor += k
+        assert cursor == len(stream_order)
+        return rounds
 
     def _build_unlabeled_stream(self, class_balanced_initial):
         """无标签协议的数据流构造。
@@ -240,18 +268,7 @@ class CausalStream:
         self.base_indices = np.sort(np.concatenate(self.base_indices))
         rest = np.concatenate(rest_indices)
         # 唯一决定流式顺序的随机源：固定种子 + 样本索引
-        stream_order = rest[rng.permutation(len(rest))]
-        per = len(stream_order) // self.num_rounds
-        rem = len(stream_order) - per * self.num_rounds
-        # 正式协议 39200 = 80 × 490（rem=0）；余数只在非整除的小配置下出现，
-        # 平摊到前 rem 轮，保证总量与顺序不变
-        sizes = [per + (1 if i < rem else 0)
-                 for i in range(self.num_rounds)]
-        self.round_indices, cursor = [], 0
-        for k in sizes:
-            self.round_indices.append(stream_order[cursor:cursor + k].copy())
-            cursor += k
-        assert cursor == len(stream_order)
+        self.round_indices = self._even_round_split(rest, rng)
         # 流式轮次不按真实类别统计（避免任何类别分桶语义）
         self.round_class_counts = np.zeros(
             (self.num_rounds, self.num_classes), dtype=np.int64)

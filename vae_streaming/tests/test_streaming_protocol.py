@@ -201,6 +201,23 @@ def test_alignment_uses_history_only():
     assert torch.allclose(al.bias, al2.bias)
 
 
+def test_alignment_fit_mask_covers_every_class():
+    """锚点按类拼接时，拟合/留出必须在每个类内部划分。"""
+    from vae_streaming.models.feature_alignment import _per_class_fit_mask
+
+    # 模拟 _stratified_anchor_indices 的输出：类 0..99 连续排列，每类 2 个
+    labels = torch.arange(100).repeat_interleave(2)
+    mask = _per_class_fit_mask(labels)
+    assert int(mask.sum()) == 100
+    assert set(labels[mask].tolist()) == set(range(100))
+    assert set(labels[~mask].tolist()) == set(range(100))
+    # 每类 20 个锚点的 CIFAR-10 情形同样覆盖全部类
+    labels10 = torch.arange(10).repeat_interleave(20)
+    m10 = _per_class_fit_mask(labels10)
+    assert set(labels10[m10].tolist()) == set(range(10))
+    assert set(labels10[~m10].tolist()) == set(range(10))
+
+
 # ======================================================================
 # 9. 当前代表特征与云端同步代表特征具有相同版本
 # ======================================================================
@@ -347,6 +364,19 @@ def test_cloud_state_preserved():
                        learner.model.state_dict()["fc.weight"])
 
 
+def test_cloud_epochs_mode_derives_steps_from_data_size():
+    """epochs_per_round>0：每轮步数 = epochs × ceil(N / batch)。"""
+    cfg = {"cloud": {"head": "linear", "lr": 1e-3, "wd": 0.0, "batch": 8,
+                     "epochs_per_round": 5, "seed": 0}}
+    learner = IncrementalCloudLearner(cfg, dim=8, num_classes=2, device="cpu")
+    x = torch.randn(20, 8)
+    y = torch.arange(20) % 2
+    info = learner.update(x, y, round_idx=0)
+    assert info["epochs_per_round"] == 5
+    assert info["steps"] == 5 * 3  # ceil(20 / 8) = 3
+    assert learner.steps_done == 15
+
+
 # ======================================================================
 # 17. 测试集不参与流式训练
 # ======================================================================
@@ -431,6 +461,19 @@ def test_covariate_shift_deterministic():
     assert a.dtype == torch.uint8
     assert torch.equal(apply_covariate_shift(x, 0.0), x)
     assert not torch.equal(a, x)
+
+
+def test_iid_stream_keeps_all_classes_every_round():
+    """IID 流不能因配额平票而让末轮只剩少数类（CIFAR-100 r79 曾只剩 10 类）。"""
+    s = CausalStream(dataset="cifar100", initial_fraction=0.20, num_rounds=80,
+                     seed=42, scenario="iid")
+    per_round = [int((s.round_class_counts[r] > 0).sum())
+                 for r in range(s.num_rounds)]
+    assert min(per_round) >= 90, f"末轮类别覆盖不足: {per_round[-5:]}"
+    assert all(int(s.round_class_counts[r].sum()) in (489, 490)
+               for r in range(s.num_rounds))
+    assert int(s.round_class_counts[-1].max()) < 25, "末轮仍被少数类主导"
+    assert len(np.concatenate(s.round_indices)) == 49000 - len(s.base_indices)
 
 
 def test_label_shift_stream():
@@ -675,11 +718,246 @@ def test_online_kmeans_inherits_initial_cluster_counts():
     labels = torch.tensor([0, 0, 1, 1])
     km = OnlineKMeans(feats, labels, [2, 2], dim=2, seed=0,
                       initial_counts=[10, 10])
-    assert km.counts.tolist() == [10, 10]
+    # 每类 10 广播到该类两个质心 -> 每个质心单独计数
+    assert km.counts.tolist() == [10, 10, 10, 10]
     km.update(torch.tensor([[1.0, 0.0]]), torch.tensor([0]))
-    assert km.counts.tolist() == [11, 10]
+    assert km.counts.tolist() == [11, 10, 10, 10]
     # lr = 1/11，质心只移动 1/11，而不是被单个样本整体覆盖
     assert torch.allclose(km.features[0], torch.tensor([1.0 / 11.0, 0.0]),
                           atol=1e-6)
     restored = OnlineKMeans.from_state_dict(km.state_dict())
-    assert restored.counts.tolist() == [11, 10]
+    assert restored.counts.tolist() == [11, 10, 10, 10]
+
+
+def test_online_kmeans_counts_are_per_centroid():
+    """同类其它质心收到的样本不得压低本质心的学习率。"""
+    from vae_streaming.distillation.online_coreset import OnlineKMeans
+
+    feats = torch.tensor([[0.0, 0.0], [10.0, 0.0]])
+    km = OnlineKMeans(feats, torch.tensor([0, 0]), [2], dim=2, seed=0,
+                      initial_counts=[10])
+    # 100 个样本全部靠近质心 #0
+    km.update(torch.tensor([[0.1, 0.0]]).repeat(100, 1), torch.zeros(100,
+                                                                     dtype=torch.long))
+    assert km.counts.tolist() == [110, 10]
+    # 质心 #1 的下一个样本应使用 1/11，而不是 1/111
+    km.update(torch.tensor([[10.1, 0.0]]), torch.tensor([0]))
+    assert km.counts.tolist() == [110, 11]
+    assert torch.allclose(km.features[1],
+                          torch.tensor([10.0 + 0.1 / 11.0, 0.0]), atol=1e-6)
+
+
+# ======================================================================
+# 30. ExStream：类缓冲满时合并最近对，新样本占独立槽位
+# ======================================================================
+def test_exstream_merges_closest_pair_when_class_full():
+    from vae_streaming.distillation.online_coreset import ExStreamCoreset
+
+    feats = torch.tensor([[0.0, 0.0], [10.0, 0.0],
+                          [0.0, 10.0], [10.0, 10.0]])
+    labels = torch.tensor([0, 0, 1, 1])
+    ex = ExStreamCoreset(feats, labels, [2, 2], dim=2, seed=0,
+                         initial_counts=[1, 1, 1, 1])
+    out = ex.update(torch.tensor([[5.0, 0.0]]), torch.tensor([0]))
+    # 类 0 的最近对 (0,0)/(10,0) 合并，槽 0 放新样本、槽 1 放合并代表
+    assert torch.allclose(out["features"][0], torch.tensor([5.0, 0.0]))
+    assert torch.allclose(out["features"][1], torch.tensor([5.0, 0.0]))
+    assert ex.counts.tolist() == [1, 2, 1, 1]
+    assert out["info"]["n_merged"] == 1
+    assert out["info"]["n_slots"] == 4
+    # 另一类不受影响
+    assert torch.allclose(out["features"][2:], feats[2:])
+
+
+def test_exstream_fills_empty_slots_before_merging():
+    from vae_streaming.distillation.online_coreset import ExStreamCoreset
+
+    ex = ExStreamCoreset(torch.zeros(2, 2), torch.tensor([0, 0]), [2],
+                         dim=2, seed=0, initial_counts=[0, 0])
+    out = ex.update(torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+                    torch.tensor([0, 0]))
+    assert torch.allclose(out["features"][0], torch.tensor([1.0, 1.0]))
+    assert torch.allclose(out["features"][1], torch.tensor([2.0, 2.0]))
+    assert ex.counts.tolist() == [1, 1]
+    assert out["info"]["n_merged"] == 0
+    assert out["info"]["n_inserted"] == 2
+
+
+def test_exstream_single_slot_absorbs_instead_of_self_merge():
+    """单槽类（quota=1 或部分更新只放开 1 个槽）不能 gi==gj 自合并丢样本。"""
+    from vae_streaming.distillation.online_coreset import ExStreamCoreset
+
+    # quota=1：类 0 只有一个槽，count=3
+    ex = ExStreamCoreset(torch.tensor([[0.0, 0.0], [10.0, 0.0]]),
+                         torch.tensor([0, 1]), [1, 1], dim=2, seed=0,
+                         initial_counts=[3, 1])
+    out = ex.update(torch.tensor([[3.0, 0.0]]), torch.tensor([0]))
+    assert torch.allclose(out["features"][0],
+                          torch.tensor([0.75, 0.0]))
+    assert ex.counts.tolist() == [4, 1]
+    assert out["info"]["n_merged"] == 1
+    assert torch.allclose(out["features"][1], torch.tensor([10.0, 0.0]))
+
+    # 部分更新只放开类 0 的 1 个槽（idx 长度 1），同样不能自合并
+    ex2 = ExStreamCoreset(torch.tensor([[0.0, 0.0], [2.0, 0.0],
+                                        [10.0, 0.0]]),
+                          torch.tensor([0, 0, 1]), [2, 1], dim=2, seed=0,
+                          initial_counts=[1, 3, 1])
+    out2 = ex2.update(torch.tensor([[4.0, 0.0]]), torch.tensor([0]),
+                      allowed_idx=torch.tensor([0]))
+    assert torch.allclose(out2["features"][0], torch.tensor([2.0, 0.0]))
+    assert ex2.counts.tolist() == [2, 3, 1]
+    assert torch.allclose(out2["features"][1], torch.tensor([2.0, 0.0]))
+
+
+# ======================================================================
+# 31. KIP：核回归损失下降，未授权位置严格保持不变
+# ======================================================================
+def test_kip_reduces_loss_and_holds_unallowed_rows():
+    from vae_streaming.distillation.kip import KIPDistiller
+
+    torch.manual_seed(0)
+    C, D = 3, 8
+    centers = torch.randn(C, D) * 3
+    sup = torch.cat([centers[c] + 0.3 * torch.randn(5, D) for c in range(C)])
+    sy = torch.repeat_interleave(torch.arange(C), 5)
+    tgt = torch.cat([centers[c] + 0.5 * torch.randn(40, D) for c in range(C)])
+    ty = torch.repeat_interleave(torch.arange(C), 40)
+
+    kip = KIPDistiller(sup, sy, [5] * C,
+                       {"kip_steps": 20, "kip_lr": 0.02,
+                        "kip_ridge": 0.01}, device="cpu")
+    out = kip.update(real_features=tgt, real_labels=ty)
+    assert torch.isfinite(out["features"]).all()
+    assert out["info"]["loss_last"] <= out["info"]["loss_first"]
+    assert out["info"]["steps"] == 20
+
+    kip2 = KIPDistiller(sup, sy, [5] * C,
+                        {"kip_steps": 5, "kip_lr": 0.02}, device="cpu")
+    out2 = kip2.update(real_features=tgt, real_labels=ty,
+                       allowed_idx=torch.arange(5))
+    assert torch.equal(out2["features"][5:], sup[5:])
+
+
+def test_kip_bandwidth_samples_across_ordered_classes():
+    """带宽估计必须跨类别取样：前缀采样只看前几类会严重低估 sigma2。"""
+    from vae_streaming.distillation.kip import _median_sqdist
+
+    # 按类连续排列：三簇分别位于原点、10、20
+    a = torch.cat([torch.zeros(100, 2), torch.full((100, 2), 10.0),
+                   torch.full((100, 2), 20.0)])
+    b = a.clone()
+    sigma2 = _median_sqdist(a, b, max_n=30)
+    # 前缀采样只会看到原点附近（median=0）；等距跨步覆盖三簇后应显著大于 0
+    assert sigma2 > 10.0
+
+
+# ======================================================================
+# 32. CIFAR-10 / CIFAR-100 主配置必须逐项对齐，只允许数据集相关键不同
+# ======================================================================
+def _flatten_cfg(d, prefix=""):
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(_flatten_cfg(v, prefix + k + "."))
+        else:
+            out[prefix + k] = v
+    return out
+
+
+def test_cifar10_cifar100_configs_are_parallel():
+    from vae_streaming.config_utils import load_config
+
+    pairs = [
+        ("vae_streaming/configs/cifar10.yaml",
+         "vae_streaming/configs/cifar100.yaml",
+         {"_path", "dataset", "num_classes"}),
+        ("vae_streaming/configs/cifar10_supervised_multi80_u2.yaml",
+         "vae_streaming/configs/cifar100_supervised_multi80_u2.yaml",
+         {"_path", "dataset", "num_classes", "protocol_version"}),
+    ]
+    for p10, p100, allowed in pairs:
+        c10 = _flatten_cfg(load_config(p10))
+        c100 = _flatten_cfg(load_config(p100))
+        assert set(c10) == set(c100), (
+            f"{p10} 与 {p100} 的配置键不一致："
+            f"仅 C10 {sorted(set(c10) - set(c100))}，"
+            f"仅 C100 {sorted(set(c100) - set(c10))}")
+        for k in sorted(c10):
+            if k in allowed:
+                continue
+            assert c10[k] == c100[k], (
+                f"{p10} 与 {p100} 的 {k} 不一致：{c10[k]!r} vs {c100[k]!r}")
+
+
+def _assert_derived_config(base_path, derived_path, allowed_common,
+                           extra_derived=()):
+    from vae_streaming.config_utils import load_config
+
+    base = _flatten_cfg(load_config(base_path))
+    derived = _flatten_cfg(load_config(derived_path))
+    missing = sorted(set(base) - set(derived))
+    assert not missing, f"{derived_path} 缺少主配置键: {missing}"
+    extra = sorted(set(derived) - set(base))
+    assert set(extra) <= set(extra_derived), (
+        f"{derived_path} 出现未登记的新键: "
+        f"{sorted(set(extra) - set(extra_derived))}")
+    for k in sorted(base):
+        if k in allowed_common:
+            continue
+        assert base[k] == derived[k], (
+            f"{derived_path} 的 {k} 与主配置不一致："
+            f"{derived[k]!r} vs {base[k]!r}")
+
+
+def test_derived_configs_stay_in_sync():
+    # 多分支诊断配置：除多分支字段外必须与 CIFAR-10 80 轮主配置一致
+    _assert_derived_config(
+        "vae_streaming/configs/cifar10_supervised_multi80_u2.yaml",
+        "vae_streaming/configs/cifar10_multi_branch80.yaml",
+        {"_path", "protocol_version"},
+        extra_derived={
+            "cloud.short_steps", "cloud.multi_branch",
+            "cloud.branches.inc200_steps", "cloud.branches.inc20_steps",
+            "cloud.branches.scratch200_steps",
+            "cloud.branches.scratch20_steps"})
+    # CIFAR-100 变体：只允许预算 / 更新频率 / 协议名不同
+    for name, allowed in (
+            ("cifar100_supervised_multi80_u2_b9800.yaml",
+             {"_path", "protocol_version",
+              "memory.representative_budget"}),
+            ("cifar100_supervised_multi80_u2_ue8.yaml",
+             {"_path", "protocol_version", "vae.update_every_rounds"}),
+            ("cifar100_supervised_multi80_u2_ue16.yaml",
+             {"_path", "protocol_version", "vae.update_every_rounds"})):
+        _assert_derived_config(
+            "vae_streaming/configs/cifar100_supervised_multi80_u2.yaml",
+            "vae_streaming/configs/" + name, allowed)
+
+
+# ======================================================================
+# 31. 100 类路径：配额、代表集与云端头不能假定 10 类
+# ======================================================================
+def test_cifar100_class_count_contracts():
+    from vae_bdm.cloud import build_cloud
+
+    y = np.repeat(np.arange(100), 98)
+    quotas = allocate_quotas(y, 980, 100)
+    assert quotas.shape == (100,)
+    assert int(quotas.sum()) == 980
+    assert int(quotas.min()) >= 9 and int(quotas.max()) <= 10
+
+    mem = RepresentativeMemory(980, 100, quotas=quotas, dim=1024)
+    mem.features = torch.zeros(980, 1024)
+    assert mem.assert_budget()
+    assert mem.labels.shape == (980,)
+    assert int(mem.labels.max()) == 99
+
+    model = build_cloud("mlp", 1024, 100)
+    with torch.no_grad():
+        out = model(torch.randn(2, 1024))
+    assert out.shape == (2, 100)
+
+
+
+

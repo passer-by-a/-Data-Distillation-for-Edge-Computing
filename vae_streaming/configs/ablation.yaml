@@ -9,6 +9,7 @@ base_channels: 64
 
 stream:
   scenario: iid
+  label_mode: supervised_stream
   initial_fraction: 0.20
   num_rounds: 5
   shuffle_seed: 42
@@ -84,6 +85,7 @@ cloud:
   batch: 256
   seed: 0
   val_mode: external
+  select_best_on_val: false         # 与主口径一致，禁止用 val 标签选轮次
   epochs: 50
 
 evaluation:

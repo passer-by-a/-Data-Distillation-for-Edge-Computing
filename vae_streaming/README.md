@@ -31,6 +31,11 @@ stream:
 
 - 80 轮每轮 490 张（49,000 − 9,800 = 39,200 均分）；5 轮（7,840/轮）、
   40 轮（980/轮）与 392 轮（100/轮）是同一协议下的其他分组口径。
+- IID 流：剩余样本用固定种子整体打乱一次后等分各轮（不按类配额逐轮补足）。
+  按类配额补足时所有类小数部分相同，稳定排序会固定偏向低编号类，导致
+  CIFAR-100 末期低编号类先耗尽、最后一轮只剩类 90–99。
+- 云端每次更新固定 5 个 epoch（步数 = 5 × ceil(同步集大小 / batch)，980
+  代表时约 20 步），不再固定 200 步。
 - `CausalStream.round(t)` 有访问守卫：访问 `t+1` 及以后直接抛错。
 - Base 与所有轮次索引互斥；`assert_no_leakage(t, idx)` 可审计。
 - 测试集只用于评估；不进入 VAE 训练、统计记忆、代表集或 DM。
@@ -178,7 +183,7 @@ L_SDM = ||mean(f(real_z)) − mean(f(syn_z))||² + λ_a·||S − S_aligned_prev|
   对 3 组均值匹配损失取平均（`dm_multi`）；`feature_type=plain` 为单 MLP（`dm`）。
   两者共享其余全部预算与协议。
 
-### 3.5 通信
+### 3.6 通信
 
 - INT8 使用第一阶段的非对称 uint8 协议（`vae_bdm.quant.Quantizer`）。
 - **Full Sync**：每轮上传全部 980×1024 特征。
@@ -193,7 +198,7 @@ L_SDM = ||mean(f(real_z)) − mean(f(syn_z))||² + λ_a·||S − S_aligned_prev|
 ## 4. 运行
 
 ```bash
-# 单元测试（34 项：28 项流式协议 + 6 项标签协议）
+# 单元测试（43 项：37 项流式协议 + 6 项标签协议）
 python -m pytest vae_streaming/tests -q
 
 # 80 轮监督五方法（当前主口径：80 × 490，每 2 轮更新一次）
@@ -314,6 +319,10 @@ CIFAR-10 的 20% Base 已能训练出较强编码器，初始精度 **76.08±0.5
    但绝对差距小于 CIFAR-100。
 2. K-means 在 C10 上同样收缩方差（0.40），精度也最低。
 
+> 该 5 轮表由旧配置生成（`cloud.select_best_on_val` 当时默认为 true，存在用验证集
+> 选最优轮次的机会）；当前 `cifar10.yaml` 已显式设为 false，与 80 轮主口径一致。
+> 因此这张 5 轮表不能直接与当前代码的新结果或 80 轮主表混用，需要按新口径重跑。
+
 ### 5.2 Label Shift / Covariate Shift（M3 已跑）
 
 分布变化场景目前只有 Replay + 原版 DM 的结果（其余两方法待跑）：
@@ -332,9 +341,12 @@ CIFAR-10 的 20% Base 已能训练出较强编码器，初始精度 **76.08±0.5
 五方法共享同一 Initial Base VAE 权重（各方法权重逐位相同），DM / K-means / Moment
 共用同一初始代表集；每个 seed 内 40 次更新记录的 `encoder_sha1` 全部一致
 （末轮：seed42 `c99628fc00f2373f`、seed43 `f918ab02e872a88b`、seed44 `ac877cc0033185f7`）。
-`--seeds` 只改 `vae.seed`，`split_seed` / `shuffle_seed` 固定 42，因此三 seed 共用同一
-数据流（`stream_sha1=b75d2a809942de30`）与同一 Base 索引（`base_indices_sha1=9d36421552fc6fdf`），
-差异来自 Initial Base VAE 初始化、DM 随机特征与云端头种子。
+`--seeds` 只改变运行 seed：Initial Base VAE 初始化、在线 VAE 增强随机流、
+代表集 / Replay / K-means 初始化会随之变化；`split_seed` / `shuffle_seed` 固定 42，
+因此三 seed 共用同一数据流（`stream_sha1=b75d2a809942de30`）与同一 Base 索引
+（`base_indices_sha1=9d36421552fc6fdf`）。注意 **DM 随机特征网络的 `feature_seed`
+和云端 MLP 的 `cloud.seed` 固定为 0**，不随运行 seed 变化；三 seed 的标准差
+不包含这两类初始化方差。
 “r0”是初始同步后的精度；五个方法现在共用同一初始代表集（Reservoir 也改用 KMeans 初始化，
 tag `sameinit80` 重跑），Base VAE 权重本身各方法逐位相同。
 

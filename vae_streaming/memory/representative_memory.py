@@ -13,17 +13,25 @@ from vae_bdm.baselines import allocate_quotas
 
 
 def _select_class(z, q, method, seed, cfg):
+    """返回 (代表特征, 每个代表对应的 Base 簇大小)。
+
+    簇大小用于 Online K-means 的逐质心计数初始化；random 初始化没有聚类
+    语义，每个代表视为来自 1 个样本。
+    """
     z = z.float().cpu()
     if q > len(z):
         raise ValueError(f"类别样本不足: 需要 {q}, 实际 {len(z)}")
     if method == "random":
         rng = np.random.RandomState(seed)
         sel = rng.choice(len(z), q, replace=False)
-        return z[sel]
+        return z[sel], np.ones(q, dtype=np.int64)
     if method == "kmeans":
         km = KMeans(n_clusters=q, random_state=seed, n_init=1, max_iter=100)
         km.fit(z.numpy())
-        return torch.from_numpy(km.cluster_centers_).float()
+        # 空簇回退为 1，避免后续 1/count 无定义
+        sizes = np.maximum(np.bincount(km.labels_, minlength=q), 1)
+        return (torch.from_numpy(km.cluster_centers_).float(),
+                sizes.astype(np.int64))
     raise ValueError(f"未知初始化方法: {method}")
 
 
@@ -31,7 +39,8 @@ def initialize_representatives(x, y, quotas, method="kmeans", seed=42,
                                device="cpu", cfg=None):
     """在 Initial Base Set 特征上初始化代表集。
 
-    返回 (features [M,D], labels [M])，类别顺序与 quotas 一致。
+    返回 (features [M,D], labels [M], cluster_counts [M])，类别顺序与
+    quotas 一致；cluster_counts 是该代表在 Base 聚类中聚合的样本数。
     """
     x = torch.as_tensor(x).float().cpu()
     y = torch.as_tensor(y).long().cpu()
@@ -54,14 +63,19 @@ def initialize_representatives(x, y, quotas, method="kmeans", seed=42,
         out = dm.fit(verbose=False)
         reps, labels = out["features"], out["labels"]
         order = torch.argsort(labels, stable=True)
-        return reps[order].float().cpu(), labels[order].long()
+        # BDM 初始化的簇大小未知，按每个代表 1 个样本计
+        return (reps[order].float().cpu(), labels[order].long(),
+                np.ones(len(reps), dtype=np.int64))
 
-    reps, labels = [], []
+    reps, labels, counts = [], [], []
     for c, q in enumerate(quotas):
         z = x[y == c]
-        reps.append(_select_class(z, q, method, seed + c, cfg))
+        rep, cnt = _select_class(z, q, method, seed + c, cfg)
+        reps.append(rep)
+        counts.append(cnt)
         labels += [c] * q
-    return torch.cat(reps, 0).float(), torch.tensor(labels, dtype=torch.long)
+    return (torch.cat(reps, 0).float(), torch.tensor(labels, dtype=torch.long),
+            np.concatenate(counts).astype(np.int64))
 
 
 class RepresentativeMemory:
@@ -92,16 +106,19 @@ class RepresentativeMemory:
         self.versions = torch.full((self.budget,), -1, dtype=torch.long)
         self.submitted_versions = torch.full((self.budget,), -1, dtype=torch.long)
         self.last_round = torch.full((self.budget,), -1, dtype=torch.long)
+        # 每个代表在 Base 聚类中聚合的样本数（Online K-means 逐质心计数用）
+        self.cluster_counts = np.ones(self.budget, dtype=np.int64)
         self.initialized = False
 
     # ------------------------------------------------------------------
     def initialize_from_features(self, x, y, method="kmeans", version=0,
                                  seed=42, device="cpu", cfg=None):
-        feats, labels = initialize_representatives(
+        feats, labels, counts = initialize_representatives(
             x, y, self.quotas, method=method, seed=seed, device=device, cfg=cfg)
         if not torch.equal(labels, self.labels):
             raise RuntimeError("初始化代表集的类别顺序与配额不一致")
         self.features = feats.float().cpu()
+        self.cluster_counts = np.asarray(counts, dtype=np.int64)
         self.submitted = self.features.clone()
         self.versions.fill_(int(version))
         self.submitted_versions.fill_(int(version))
@@ -163,7 +180,8 @@ class RepresentativeMemory:
     def assert_budget(self):
         assert len(self.features) == self.budget
         assert len(self.labels) == self.budget
-        assert self.features.size(1) == self.dim == 1024
+        # 维度由构造时的 dim 决定，不写死 1024（CIFAR-10/100 当前都是 1024）
+        assert self.features.size(1) == self.dim
         return True
 
     def summary(self, stats=None):
@@ -197,6 +215,7 @@ class RepresentativeMemory:
                 "versions": self.versions.clone(),
                 "submitted_versions": self.submitted_versions.clone(),
                 "last_round": self.last_round.clone(),
+                "cluster_counts": self.cluster_counts.copy(),
                 "initialized": self.initialized, "slices": copy.deepcopy(self.slices)}
 
     @classmethod
@@ -210,6 +229,10 @@ class RepresentativeMemory:
         obj.versions = st["versions"].clone()
         obj.submitted_versions = st["submitted_versions"].clone()
         obj.last_round = st["last_round"].clone()
+        # 旧 checkpoint 没有 cluster_counts：退回每代表 1 个样本
+        obj.cluster_counts = np.asarray(
+            st.get("cluster_counts", np.ones(obj.budget, dtype=np.int64)),
+            dtype=np.int64)
         obj.initialized = bool(st["initialized"])
         obj.slices = copy.deepcopy(st["slices"])
         return obj

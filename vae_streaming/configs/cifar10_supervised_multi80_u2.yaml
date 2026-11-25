@@ -71,7 +71,7 @@ communication:
 cloud:
   head: mlp
   incremental_training: true
-  steps_per_round: 200
+  epochs_per_round: 5             # 每次云端更新固定 5 个 epoch
   lr: 0.001
   wd: 0.0001
   batch: 256

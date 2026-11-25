@@ -19,6 +19,7 @@ from vae_bdm.baselines import allocate_quotas
 from vae_bdm.quant import Quantizer
 
 from ..cloud.incremental_trainer import IncrementalCloudLearner
+from ..cloud.multi_branch import MultiBranchCloudLearner
 from ..cloud.state_sync import CloudState
 from ..communication.payload_accounting import (CommunicationLedger,
                                                 build_sync_message,
@@ -26,9 +27,11 @@ from ..communication.payload_accounting import (CommunicationLedger,
                                                 select_patch_indices)
 from ..communication.quantization import decode_features, encode_features
 from ..data.causal_stream import CausalStream, regroup_stream_rounds
+from ..distillation.kip import KIPDistiller
 from ..distillation.margin_matching import MarginQuantileMatcher
 from ..distillation.moment_calibration import streaming_moment_calibrate
-from ..distillation.online_coreset import OnlineKMeans, build_coreset
+from ..distillation.online_coreset import (build_coreset,
+                                           coreset_from_state_dict)
 from ..distillation.streaming_dm import StreamingDM
 from ..memory.replay_buffer import (ClassBalancedReservoir,
                                     FeatureReservoir)
@@ -85,6 +88,21 @@ METHOD_OVERRIDES = {
                 "replay_ratio": 0.25},
         "alignment": {"method": "diagonal_affine"},
         "distillation": {"method": "reservoir_latent"},
+        "communication": {"mode": "full_sync"}},
+    # KIP：潜空间 RBF 核岭回归蒸馏（闭式解 + 对 support 特征反传）
+    "kip": {
+        "vae": {"online_update": True, "replay_enabled": True,
+                "replay_ratio": 0.25},
+        "alignment": {"method": "diagonal_affine"},
+        "distillation": {"method": "kip", "kip_steps": 20, "kip_lr": 0.01,
+                         "kip_ridge": 0.01, "kip_bandwidth_mult": 1.0},
+        "communication": {"mode": "full_sync"}},
+    # ExStream：类缓冲满时合并类内最近的两个旧代表，新样本占独立槽位
+    "exstream": {
+        "vae": {"online_update": True, "replay_enabled": True,
+                "replay_ratio": 0.25},
+        "alignment": {"method": "diagonal_affine"},
+        "distillation": {"method": "exstream"},
         "communication": {"mode": "full_sync"}},
 }
 
@@ -165,6 +183,13 @@ for _name, _base in {"kmeans_g5": "online_kmeans",
     METHOD_OVERRIDES[_name] = deep_merge(
         METHOD_OVERRIDES[_base],
         {"vae": {"online_lr": 3e-4, "online_cls_lambda": 0.2}})
+
+
+def _make_cloud_learner(cfg, dim, num_classes, device):
+    """多分支在线配对实验：一份边缘轨迹驱动四个云端分类器"""
+    if bool(cfg["cloud"].get("multi_branch", False)):
+        return MultiBranchCloudLearner(cfg, dim, num_classes, device=device)
+    return IncrementalCloudLearner(cfg, dim, num_classes, device=device)
 
 
 def _seed_everything(seed):
@@ -463,12 +488,26 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 "无标签 DM 的匹配目标必须包含 Base Replay 的真实特征，"
                 "请设置 distillation.exact_target=True")
     select_best_on_val = bool(cfg["cloud"].get("select_best_on_val", True))
+    multi_branch = bool(cfg["cloud"].get("multi_branch", False))
+    # 多分支实验需要逐轮验证指标，但验证集只用于评估，不参与轮内选优
+    need_val_feats = select_best_on_val or multi_branch
     # DM 精确目标：每轮都用当前 encoder 重编码 replay+current 作为同一目标集合
     dm_exact = distill == "dm" and bool(
         cfg["distillation"].get("exact_target", False))
+    # KIP 的 support 已是当前版本代表，目标集需与 DM 一致（replay+current）
+    kip_exact = distill == "kip"
     signature = _state_signature(cfg, tag, seed)
 
     stream = _build_stream(cfg, stream)
+    if int(C) != int(stream.num_classes):
+        raise ValueError(
+            f"cfg.num_classes={C} 与数据集 {cfg['dataset']} 实际类别数 "
+            f"{stream.num_classes} 不一致，拒绝运行")
+    expected_dim = int(cfg["latent_dim"]) * 8 * 8
+    if int(cfg["feature_dim"]) != expected_dim:
+        raise ValueError(
+            f"cfg.feature_dim={cfg['feature_dim']} 与 EdgeVAE 潜空间展平维度 "
+            f"{expected_dim} 不一致，拒绝运行")
     base_sig = _base_signature(cfg, seed, stream)
     ckpt0 = checkpoint_path(
         cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt")
@@ -541,14 +580,14 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         stats = StreamingStatistics.from_state_dict(st["statistics"])
         replay = ClassBalancedReservoir.from_state_dict(st["replay"])
         cloud = CloudState.from_state_dict(st["cloud"])
-        learner = IncrementalCloudLearner(cfg, dim, C, device=device)
+        learner = _make_cloud_learner(cfg, dim, C, device)
         learner.load_state_dict(st["learner"])
         ledger = CommunicationLedger()
         ledger.entries = copy.deepcopy(st["ledger"])
-        if distill == "kmeans":
+        if distill in ("kmeans", "exstream"):
             if st.get("coreset") is None:
-                raise ValueError("断点缺少 kmeans coreset 状态")
-            coreset = OnlineKMeans.from_state_dict(st["coreset"])
+                raise ValueError(f"断点缺少 {distill} coreset 状态")
+            coreset = coreset_from_state_dict(st["coreset"], distill)
         else:
             coreset = None
         if distill == "reservoir":
@@ -614,15 +653,12 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         replay.add_batch(base.images, base.labels)
 
         coreset = None
-        if distill == "kmeans":
-            # 初始质心由 Base 各类样本聚类得到，其“已见样本数”应从
-            # 平均簇大小起步，否则首个流式样本会以 lr=1 覆盖质心。
-            base_counts = np.bincount(np.asarray(base.labels), minlength=C)
-            init_counts = [max(1, int(round(int(n) / max(int(q), 1))))
-                           for n, q in zip(base_counts, quotas)]
+        if distill in ("kmeans", "exstream"):
+            # 每个质心独立计数；初始“已见样本数”继承 Base 聚类的实际簇大小
+            # （memory.cluster_counts），而不是每类共用一个平均值。
             coreset = build_coreset(distill, memory.features, memory.labels,
                                     quotas, dim=dim, seed=int(seed),
-                                    initial_counts=init_counts)
+                                    initial_counts=memory.cluster_counts)
 
         # Online Reservoir 基线：与代表集同预算的类平衡原始样本缓冲，
         # 初始内容取自 Initial Base Set，代表特征由当前 Encoder 精确重编码
@@ -654,7 +690,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             # 覆盖，保证 r0 与其余方法逐位一致。
 
         cloud = CloudState.empty(budget, dim)
-        learner = IncrementalCloudLearner(cfg, dim, C, device=device)
+        learner = _make_cloud_learner(cfg, dim, C, device)
         ledger = CommunicationLedger()
 
         # ---------------- 初始完整同步 ----------------
@@ -676,14 +712,20 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         val_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if select_best_on_val else None
+            if need_val_feats else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
-        cloud_init = learner.update(cloud.features, cloud.labels, val_feats,
+        cloud_init = learner.update(cloud.features, cloud.labels,
+                                    val_feats if select_best_on_val else None,
                                     stream.val_labels if select_best_on_val
                                     else None, round_idx=-1,
                                     mode=cloud_mode)
         init_metrics = learner.evaluate(test_feats, stream.test_labels)
+        init_branches = None
+        if hasattr(learner, "evaluate_branches"):
+            init_branches = learner.evaluate_branches(
+                val_feats, stream.val_labels, test_feats,
+                stream.test_labels, None)
         if device == "cuda":
             peak_gpu = torch.cuda.max_memory_allocated() / 1e9
 
@@ -697,6 +739,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "cloud": cloud_init,
             "cloud_param_sha1": _module_sha1(learner.model),
             "acc": init_metrics["acc"], "f1": init_metrics["f1"],
+            "val_acc": (init_branches["inc200"]["val"]["acc"]
+                        if init_branches else None),
+            "cloud_branches": init_branches,
             "sync_bytes": size,
             "sync_verify": init_verify,
             "label_mode": label_mode,
@@ -890,8 +935,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         n_cur_cls = int(len(cur_cls_y))
         # DM 精确目标 / history_mode=replay / 旧 reencode 模式都需要用当前
         # encoder 重编码历史 replay，保证目标集合与代表特征处于同一版本
-        need_rep_now = dm_exact or history_mode == "replay" or (
-            do_update and align_mode == "reencode")
+        need_rep_now = (dm_exact or kip_exact or history_mode == "replay"
+                        or (do_update and align_mode == "reencode"))
         rep_feats_reenc = None
         if need_rep_now and len(rep_imgs) > 0:
             rep_feats_reenc = protocol.normalize(
@@ -981,13 +1026,34 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 method=init_method,
                 version=new_version, round_idx=t, seed=int(seed),
                 device=device, cfg=cfg["distillation"])
-            if distill == "dm":
+            if distill in ("kmeans", "exstream"):
+                # reencode 模式会重建全部代表，coreset 必须同步重建；
+                # 否则它仍持有旧版本特征，下一轮会与 memory 脱节
+                coreset = build_coreset(distill, memory.features,
+                                        memory.labels, quotas, dim=dim,
+                                        seed=int(seed),
+                                        initial_counts=memory.cluster_counts)
+                distill_info = {"method": distill,
+                                "init": "reencode_rebuild",
+                                "target_scope": "replay_plus_current"}
+            elif distill == "dm":
                 sdm = StreamingDM(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
                 out = sdm.update(allowed_idx=opt_idx, round_idx=t,
                                  real_features=all_f, real_labels=all_y,
                                  **_margin_kwargs())
+                memory.features = out["features"]
+                distill_info = {**out["info"],
+                                "init": f"reencode_{init_method}",
+                                "target_scope": "replay_plus_current",
+                                "n_target": int(len(all_y))}
+            elif distill == "kip":
+                kd = KIPDistiller(memory.features, memory.labels,
+                                  memory.quotas, cfg["distillation"],
+                                  seed=int(seed), device=device)
+                out = kd.update(allowed_idx=opt_idx, round_idx=t,
+                                real_features=all_f, real_labels=all_y)
                 memory.features = out["features"]
                 distill_info = {**out["info"],
                                 "init": f"reencode_{init_method}",
@@ -1022,18 +1088,38 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 memory.features = out["features"]
                 distill_info = {**out["info"], "target_scope": target_scope,
                                 "n_target": int(len(real_y))}
-            elif distill == "kmeans":
+            elif distill == "kip":
+                if rep_feats_reenc is not None:
+                    real_f = torch.cat([rep_feats_reenc, cur_cls_f], 0)
+                    real_y = torch.cat([rep_labels, cur_cls_y], 0)
+                    target_scope = ("base_replay_plus_pseudo" if unlabeled
+                                    else "replay_plus_current")
+                else:
+                    real_f, real_y = cur_cls_f, cur_cls_y
+                    target_scope = "current_only"
+                kd = KIPDistiller(memory.features, memory.labels,
+                                  memory.quotas, cfg["distillation"],
+                                  seed=int(seed), device=device)
+                out = kd.update(allowed_idx=opt_idx, round_idx=t,
+                                real_features=real_f, real_labels=real_y)
+                memory.features = out["features"]
+                distill_info = {**out["info"], "target_scope": target_scope,
+                                "n_target": int(len(real_y))}
+            elif distill in ("kmeans", "exstream"):
                 if new_version > version:
                     coreset.align(alignment)
                 if n_cur_cls > 0:
                     res = coreset.update(cur_cls_f, cur_cls_y, round_idx=t,
                                          allowed_idx=opt_idx)
                     memory.features = res["features"].clone()
+                    # 计数与 coreset 保持同步，避免 memory 状态滞后于
+                    # 实际代表集（断点恢复走 coreset 自身 counts）
+                    memory.cluster_counts = coreset.counts.copy()
                     distill_info = {**res["info"],
                                     "label_source": label_source}
                 else:
                     memory.features = memory.features.clone()
-                    distill_info = {"method": "kmeans",
+                    distill_info = {"method": distill,
                                     "skipped": "no_accepted_pseudo",
                                     "label_source": label_source}
             elif distill == "moment":
@@ -1138,11 +1224,12 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # 无标签协议关闭基于独立验证集的逐轮模型选择，只做固定步数训练
         val_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if select_best_on_val else None
+            if need_val_feats else None
         test_feats = protocol.normalize(
             encode_mu(vae.encoder, stream.test_images, device=device))
         eval_encode_sec = time.time() - te
-        cloud_info = learner.update(cloud.features, cloud.labels, val_feats,
+        cloud_info = learner.update(cloud.features, cloud.labels,
+                                    val_feats if select_best_on_val else None,
                                     stream.val_labels if select_best_on_val
                                     else None, round_idx=t,
                                     mode=cloud_mode)
@@ -1174,12 +1261,18 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         test_int8 = None
         int8_sec = 0.0
+        tq = None
         if cfg.get("evaluation", {}).get("test_int8", True):
             tq0 = time.time()
             q = Quantizer("int8").fit(memory.features)
             tq = q.dequantize(q.quantize(test_feats))
             test_int8 = learner.evaluate(tq, stream.test_labels)["acc"]
             int8_sec = time.time() - tq0
+        cloud_branches = None
+        if hasattr(learner, "evaluate_branches"):
+            cloud_branches = learner.evaluate_branches(
+                val_feats, stream.val_labels, test_feats,
+                stream.test_labels, tq)
         stats_scope = stats_origin
 
         vm = evaluate_vae(vae, stream.val_images, stream.val_labels, cfg,
@@ -1243,6 +1336,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                      else int(budget),
                      "local_unsynced": local_unsynced},
             "cloud": cloud_info,
+            "cloud_branches": cloud_branches,
             "acc": met["acc"], "f1": met["f1"],
             "groups": group_metrics,
             "test_int8_acc": test_int8,

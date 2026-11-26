@@ -5,13 +5,15 @@
 ## 阶段一：静态潜空间蒸馏（`vae_bdm/`）
 
 在冻结 EdgeVAE 的 16×8×8 潜特征上做数据集蒸馏，包括 Batch DM、K-means、
-Moment、Reservoir 等方法。入口与配置见 `vae_bdm/README.md`。
+Moment 等方法。入口与配置见 `vae_bdm/README.md`。
 
 ## 阶段二：因果流式蒸馏（`vae_streaming/`）
 
-流式场景下的 Online VAE、双层记忆、跨版本对齐与 Streaming DM。
-各场景的 80 轮 / 392 轮协议、结果表和复现命令见
-`vae_streaming/README.md`。
+流式场景下的 Online VAE、双层记忆、跨版本对齐与 9 种代表集蒸馏方法
+（dm、dm_multi、online_kmeans、online_moment、online_reservoir、
+online_reservoir_latent、kip、exstream、gcr）。
+统一 80 轮协议（Initial Base 20%，每 2 轮一次在线更新）的协议细节、
+结果表与复现命令见 `vae_streaming/README.md`。
 
 ## 共享模块
 
@@ -29,20 +31,23 @@ Moment、Reservoir 等方法。入口与配置见 `vae_bdm/README.md`。
 
 ```bash
 # 单元测试
-python -m pytest vae_streaming/tests/test_streaming_protocol.py -q
+python -m pytest vae_streaming/tests -q
 
-# 阶段二：CIFAR-10 监督流式 80 轮
+# 阶段二：CIFAR-10 监督流式 80 轮，9 方法 × 3 种子
 python -m vae_streaming.experiments.run_iid \
   --config vae_streaming/configs/cifar10_supervised_multi80_u2.yaml \
-  --methods online_batch_dm,online_multi_mlp_dm,online_kmeans,online_moment,online_reservoir \
-  --seeds 42,43,44 --tag sup80
+  --methods dm,dm_multi,online_kmeans,online_moment,online_reservoir,online_reservoir_latent,kip,exstream,gcr \
+  --seeds 42,43,44 --rounds 80 --tag sup80v2
+
+# CIFAR-100 使用 cifar100_supervised_multi80_u2.yaml（其余参数相同）
 ```
 
 ## 文档
 
-- `EXPERIMENT_SUMMARY.md`：两阶段实验结果与结论
-- `LABEL_PROTOCOL_AUDIT.md`：流式标签协议审计
-- `U2_UNLABELED_REPORT.md`：无标签流式实验报告
+- `EXPERIMENT_SUMMARY.md`：两阶段实验结果与结论（最新 80 轮 9 方法 × 3 种子）
+- `vae_streaming/README.md`：流式协议、模块、复现命令与已知限制
+- 结果表：`vae_streaming/results/cifar10/main_table_multi_seed_v2.md`、
+  `vae_streaming/results/cifar100/main_table_multi_seed_v2.md`
 
 ## 不入库内容
 

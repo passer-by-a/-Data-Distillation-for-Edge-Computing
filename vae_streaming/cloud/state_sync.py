@@ -65,7 +65,15 @@ class CloudState:
                 np.asarray(message["labels"]).astype(np.int64))
             self.ids[idx] = torch.from_numpy(
                 np.asarray(message["ids"]).astype(np.int64))
-            self.versions.fill_(int(header["version"]))
+            self.versions[idx] = torch.from_numpy(
+                np.asarray(message["versions"]).astype(np.int64))
+            # 非补丁槽位在边缘侧随全局对角对齐整体推进版本；只有对齐真实
+            # 发生（version_from != version_to）时才跟随推进，否则保持原值
+            al = header.get("alignment") or {}
+            if int(al.get("version_from", -1)) != int(al.get("version_to", -1)):
+                untouched = torch.ones(len(self.features), dtype=torch.bool)
+                untouched[idx] = False
+                self.versions[untouched] = int(header["version"])
 
         self.last_sync_id = sync_id
         self.history.append({"round": header["round"], "type": header["type"],

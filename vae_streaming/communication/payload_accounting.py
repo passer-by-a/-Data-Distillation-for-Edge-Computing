@@ -5,9 +5,8 @@
 字节数同时报告理论值与真实序列化文件大小。
 """
 import hashlib
+import io
 import json
-import os
-import tempfile
 
 import numpy as np
 import torch
@@ -100,22 +99,23 @@ def build_sync_message(mode, round_idx, memory, alignment=None,
 
 
 def message_size(msg, tmp_dir=None):
-    """理论字节、真实序列化文件字节与分项"""
+    """理论字节、真实序列化字节与分项
+
+    在内存中完成 npz 序列化，字节数与真实落盘一致，但不产生临时文件
+    （tmp_dir 仅为兼容旧调用保留，已不再使用）。
+    """
     meta_bytes = len(msg["meta"].encode("utf-8"))
     breakdown = {k: int(v.nbytes) for k, v in msg.items() if k != "meta"}
     theoretical = meta_bytes + sum(breakdown.values())
-    d = tmp_dir or tempfile.mkdtemp(prefix="vae_stream_msg_")
-    os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, "sync_message.npz")
-    np.savez(p, **{k: v for k, v in msg.items() if k != "meta"},
+    buf = io.BytesIO()
+    np.savez(buf, **{k: v for k, v in msg.items() if k != "meta"},
              meta=np.asarray(msg["meta"]))
-    file_bytes = int(os.path.getsize(p))
+    file_bytes = int(buf.tell())
     return {"theoretical_bytes": int(theoretical),
             "file_bytes": file_bytes,
             "overhead_bytes": int(file_bytes - theoretical),
             "meta_bytes": int(meta_bytes),
-            "breakdown": breakdown,
-            "path": p}
+            "breakdown": breakdown}
 
 
 class CommunicationLedger:

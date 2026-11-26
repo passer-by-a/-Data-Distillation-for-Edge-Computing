@@ -173,7 +173,10 @@ def test_rejects_legacy_bdm_config():
 
 
 def test_legacy_results_still_readable():
-    old = "vae_bdm/results/cifar10_bdm_r10.json"
-    if os.path.exists(old):
-        rows = json.load(open(old))["rows"]
-        assert rows and "acc_mean" in rows[0]
+    # 原先指向已不存在的 cifar10_bdm_r10.json，导致该用例恒为空跑；
+    # 改指向现存、同样带 rows/acc_mean 结构的 legacy 基线结果
+    old = "vae_bdm/results/cifar10_baselines_r10.json"
+    if not os.path.exists(old):
+        pytest.skip("legacy 结果文件不存在")
+    rows = json.load(open(old))["rows"]
+    assert rows and "acc_mean" in rows[0]

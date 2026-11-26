@@ -41,6 +41,8 @@ class StreamingDM:
         self.margin_w = float(self.cfg.get("margin_weight", 0.0))
         self.margin_auto = bool(self.cfg.get("margin_auto_lambda", False))
         self.margin_ratio = float(self.cfg.get("margin_grad_ratio", 0.2))
+        # 自动标定的权重需要上限，否则两项目标尺度都很小时会爆炸
+        self.margin_max = float(self.cfg.get("margin_max_weight", 10.0))
         self.feature_type = str(self.cfg.get("feature_type", "mlp"))
         f_kwargs = dict(
             input_dim=self.dim,
@@ -201,7 +203,8 @@ class StreamingDM:
             margin_targets, margin_mask = margin_head.class_targets(
                 real_features, real_labels)
             margin_targets = margin_targets.to(dev)
-            margin_mask = margin_mask.to(dev)
+            # 只对本轮真正参与更新的位置计算间隔项，使每类分母与均值项一致
+            margin_mask = margin_mask.to(dev) & train
             margin_w = self.margin_w
             if (margin_lambda_state is not None
                     and margin_lambda_state.get("value") is not None):
@@ -219,6 +222,7 @@ class StreamingDM:
                     g_marg = torch.autograd.grad(marg_c0[has].sum(), pc)[0]
                     margin_w = self.margin_ratio * float(
                         g_mean.norm() / g_marg.norm().clamp_min(1e-12))
+                margin_w = min(margin_w, self.margin_max)
                 if margin_lambda_state is not None:
                     margin_lambda_state["value"] = margin_w
 

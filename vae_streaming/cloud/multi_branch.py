@@ -84,6 +84,7 @@ class MultiBranchCloudLearner:
         self.scratch20 = None
         self._base_ready = False
         self._init_same = True
+        self._init_checked = False
 
         self.history = []
         self.round = -1
@@ -148,11 +149,16 @@ class MultiBranchCloudLearner:
         self.scratch20 = IncrementalCloudLearner(
             self.cfgs["scratch20"], self.dim, self.num_classes,
             device=self.device)
-        # 两个从头组必须逐位相同的初始权重（scratch 用 seed + round 构建）
-        m200, _ = self.scratch200._build(self.scratch200.seed + int(round_idx))
-        m20, _ = self.scratch20._build(self.scratch20.seed + int(round_idx))
-        self._init_same = _module_sha1(m200) == _module_sha1(m20)
-        del m200, m20
+        # 两个从头组必须逐位相同的初始权重；该性质只由 (seed, 结构) 决定，
+        # 每次 update 都重建校验模型纯属浪费，只校验一次
+        if not self._init_checked:
+            m200, _ = self.scratch200._build(
+                self.scratch200.seed + int(round_idx))
+            m20, _ = self.scratch20._build(
+                self.scratch20.seed + int(round_idx))
+            self._init_same = _module_sha1(m200) == _module_sha1(m20)
+            del m200, m20
+            self._init_checked = True
         w0 = time.perf_counter()
         info_s200 = self.scratch200.update(x, y, None, None,
                                            round_idx=round_idx,

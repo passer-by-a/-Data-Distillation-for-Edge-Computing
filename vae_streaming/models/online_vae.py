@@ -303,17 +303,23 @@ def online_vae_update(vae, images, labels, replay_images, replay_labels,
 # ======================================================================
 @torch.no_grad()
 def evaluate_vae(vae, images, labels, cfg, batch=256, device="cuda"):
+    """诊断评估：确定性（用 mu 而非采样 z），rec/kl 与训练损失同口径。
+
+    - rec: 逐元素 MSE（与训练时的 F.mse_loss(reduction="mean") 一致）
+    - kl : 逐样本 KL 的均值（与训练时 kl.mean() 一致）
+    """
     vae.eval()
     rec_all, kl_all, correct = 0.0, 0.0, 0
     n = 0
     for i in range(0, len(labels), batch):
         x = to_float(images[i:i + batch], device)
         y = labels[i:i + batch].to(device)
-        recon, z, logits, mu, logvar = vae(x)
-        rec_all += float(F.mse_loss(recon, x, reduction="sum"))
+        _, _, _, mu, logvar = vae(x)
+        recon = vae.decode(mu)
+        rec_all += float(F.mse_loss(recon, x, reduction="mean")) * x.size(0)
         kl_all += float((-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()))
-                        .sum())
-        correct += int((logits.argmax(1) == y).sum())
+                        .sum(1).mean()) * x.size(0)
+        correct += int((vae.classify(mu).argmax(1) == y).sum())
         n += x.size(0)
     return {"rec": rec_all / max(1, n), "kl": kl_all / max(1, n),
             "cls_acc": 100.0 * correct / max(1, n), "n": int(n)}

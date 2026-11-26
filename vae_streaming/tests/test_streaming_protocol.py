@@ -861,6 +861,72 @@ def test_empty_kmeans_cluster_keeps_zero_count():
 
 
 # ======================================================================
+# 30c. GCR：从真实潜特征池中按梯度覆盖选代表，且支持对齐/断点/部分更新
+# ======================================================================
+def test_gcr_selects_real_samples_and_roundtrips():
+    from vae_streaming.distillation.online_coreset import (GCRCoreset,
+                                                           coreset_from_state_dict)
+
+    torch.manual_seed(0)
+    n_cls, per, dim, q = 3, 20, 8, 4
+    feats = torch.randn(n_cls * per, dim)
+    labels = torch.repeat_interleave(torch.arange(n_cls), per)
+    g = GCRCoreset(feats, labels, [q] * n_cls, dim=dim, seed=0,
+                   pool_mult=2.0)
+    # 代表必须逐位来自真实样本（不做质心/合成）
+    src = set(map(tuple, feats.tolist()))
+    assert g.features.shape == (n_cls * q, dim)
+    assert g.labels.tolist() == [0] * q + [1] * q + [2] * q
+    for r in g.features:
+        assert tuple(r.tolist()) in src
+    # 候选池按类受容量约束
+    assert [len(p) for p in g.pool] == [2 * q] * n_cls
+
+    g.update(torch.randn(6, dim), torch.tensor([0, 1, 2, 0, 1, 2]))
+    st = g.state_dict()
+    g2 = coreset_from_state_dict(st, "gcr")
+    assert torch.allclose(g2.features, g.features)
+    assert torch.allclose(g2.pool[1], g.pool[1])
+    assert g2.pool_seen.tolist() == g.pool_seen.tolist()
+
+
+def test_gcr_aligns_pool_and_representatives():
+    from vae_streaming.distillation.online_coreset import GCRCoreset
+
+    class _Scale:
+        version_to = 1
+
+        def apply(self, x):
+            return x * 2.0
+
+    torch.manual_seed(1)
+    g = GCRCoreset(torch.randn(12, 4), torch.tensor([0] * 6 + [1] * 6),
+                   [2, 2], dim=4, seed=0, pool_mult=2.0)
+    old_f = g.features.clone()
+    old_pool = g.pool[0].clone()
+    g.align(_Scale())
+    assert torch.allclose(g.features, old_f * 2.0)
+    assert torch.allclose(g.pool[0], old_pool * 2.0)
+
+
+def test_gcr_partial_update_only_touches_allowed_slots():
+    from vae_streaming.distillation.online_coreset import GCRCoreset
+
+    torch.manual_seed(2)
+    n_cls, per, dim, q = 2, 30, 8, 5
+    feats = torch.randn(n_cls * per, dim)
+    labels = torch.repeat_interleave(torch.arange(n_cls), per)
+    g = GCRCoreset(feats, labels, [q] * n_cls, dim=dim, seed=0,
+                   pool_mult=3.0)
+    before = g.features.clone()
+    allowed = torch.tensor([0, 5])
+    g.update(torch.randn(4, dim), torch.tensor([0, 1, 0, 1]),
+             allowed_idx=allowed)
+    diff = torch.nonzero((g.features - before).abs().sum(1) > 0).flatten()
+    assert set(diff.tolist()) <= set(allowed.tolist())
+
+
+# ======================================================================
 # 31. KIP：核回归损失下降，未授权位置严格保持不变
 # ======================================================================
 def test_kip_reduces_loss_and_holds_unallowed_rows():

@@ -361,8 +361,11 @@ class CausalStream:
         if t == 0:
             m_hist = np.zeros(len(labels), dtype=bool)
         else:
-            prev = np.concatenate([self.blocks[r % nb] for r in range(t)])
-            m_hist = np.isin(labels, np.unique(prev))
+            # 历史组 = 之前轮次强调过、且不属于当前块的类别；
+            # 旧写法未排除当前块，t≥块数后 historical 退化为全测试集
+            prev = np.setdiff1d(np.unique(np.concatenate(
+                [self.blocks[r % nb] for r in range(t)])), cur)
+            m_hist = np.isin(labels, prev)
         return {"current": m_cur, "historical": m_hist}
 
     # ------------------------------------------------------------------

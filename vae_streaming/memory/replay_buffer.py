@@ -8,12 +8,16 @@ import torch
 
 
 class ClassBalancedReservoir:
-    def __init__(self, capacity, num_classes, class_balanced=True, seed=0):
+    def __init__(self, capacity, num_classes, class_balanced=True, seed=0,
+                 allow_stream_ground_truth=False):
         if capacity <= 0:
             raise ValueError("capacity 必须为正")
         self.capacity = int(capacity)
         self.num_classes = int(num_classes)
         self.class_balanced = bool(class_balanced)
+        # 有监督流协议下，流式样本自带真实标签，允许以 stream 来源写入；
+        # 无标签协议仍只允许伪标签，避免真实标签经 replay 泄漏
+        self.allow_stream_ground_truth = bool(allow_stream_ground_truth)
         self.rng = np.random.RandomState(seed)
         if class_balanced:
             base = capacity // num_classes
@@ -42,9 +46,11 @@ class ClassBalancedReservoir:
         VAE pending 中的轮次，避免同一批样本重复进入同一个训练 batch。
 
         source: "base"（Initial Base 真实标签）或 "stream"（流式样本）。
-        流式样本只允许携带伪标签，写入真实标签会直接报错。
+        无标签协议下流式样本只允许携带伪标签；有监督流协议
+        （allow_stream_ground_truth=True）允许真实标签。
         """
-        if source == "stream" and label_source == "ground_truth":
+        if (source == "stream" and label_source == "ground_truth"
+                and not self.allow_stream_ground_truth):
             raise RuntimeError(
                 "禁止把流式真实标签写入 Replay（必须使用 initial_teacher_pseudo）")
         if source not in self.sources:
@@ -116,12 +122,14 @@ class ClassBalancedReservoir:
                 "n_replaced": int(self.total_replaced)}
 
     def state_dict(self):
-        imgs, ys = self.get()
-        return {"images": imgs, "labels": ys, "seen": self.seen.copy(),
+        # per_class 已包含全部图像/标签/轮次，不再重复保存 images/labels
+        return {"seen": self.seen.copy(),
                 "rng_state": self.rng.get_state(),
                 "caps": list(self.caps), "capacity": self.capacity,
                 "num_classes": self.num_classes,
                 "class_balanced": self.class_balanced,
+                "allow_stream_ground_truth":
+                    self.allow_stream_ground_truth,
                 "total_added": self.total_added,
                 "total_replaced": self.total_replaced,
                 "sources": dict(self.sources),
@@ -131,7 +139,9 @@ class ClassBalancedReservoir:
     @classmethod
     def from_state_dict(cls, st):
         obj = cls(st["capacity"], st["num_classes"],
-                  class_balanced=st["class_balanced"], seed=0)
+                  class_balanced=st["class_balanced"], seed=0,
+                  allow_stream_ground_truth=st.get(
+                      "allow_stream_ground_truth", False))
         obj.caps = list(st["caps"])
         obj.seen = np.asarray(st["seen"]).copy()
         obj.rng.set_state(st["rng_state"])

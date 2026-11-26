@@ -104,7 +104,15 @@ def main():
                                            args.method, C, bcfg, seed=42)
         cost = {"distill_sec": info["distill_sec"]}
 
-    steps = int(cfg["cloud"]["steps_per_round"]) * (int(s["num_rounds"]) + 1)
+    # 与在线协议一致：有 epochs_per_round 时按“轮数 × 每轮步数”推导，
+    # 否则才使用显式的 steps_per_round
+    cloud_cfg = cfg["cloud"]
+    if int(cloud_cfg.get("epochs_per_round", 0)) > 0:
+        per_round_steps = int(cloud_cfg["epochs_per_round"]) * int(
+            np.ceil(len(reps) / int(cloud_cfg["batch"])))
+    else:
+        per_round_steps = int(cloud_cfg["steps_per_round"])
+    steps = per_round_steps * (int(s["num_rounds"]) + 1)
     accs, f1s, infos = [], [], []
     for seed in [int(x) for x in args.seeds.split(",") if x.strip()]:
         model, info = train_cloud_classifier(

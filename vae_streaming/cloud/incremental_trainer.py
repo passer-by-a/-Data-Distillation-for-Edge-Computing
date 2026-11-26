@@ -85,6 +85,15 @@ class IncrementalCloudLearner:
                 torch.cuda.manual_seed_all(self.seed + 104729 * int(round_idx))
 
             g = torch.Generator().manual_seed(self.seed + 7919 * int(round_idx))
+            # 同步集足够小时整体驻留 GPU，避免每步重复 H2D 拷贝
+            dev_x = dev_y = dev_xv = None
+            if self.device.type == "cuda":
+                max_bytes = 256 * 1024 ** 2
+                if x.numel() * x.element_size() <= max_bytes:
+                    dev_x, dev_y = x.to(self.device), y.to(self.device)
+                if (xv is not None and xv.numel() * xv.element_size()
+                        <= max_bytes):
+                    dev_xv = xv.to(self.device)
             batches = None
             if self.epochs_per_round > 0:
                 # 固定 5 个 epoch：每轮完整遍历当前同步集，最后不足一个
@@ -114,8 +123,9 @@ class IncrementalCloudLearner:
                 with torch.no_grad():
                     pred = []
                     for i in range(0, len(xv), 512):
-                        pred.append(self.model(xv[i:i + 512].to(self.device))
-                                    .argmax(1).cpu())
+                        xvb = (dev_xv[i:i + 512] if dev_xv is not None
+                               else xv[i:i + 512].to(self.device))
+                        pred.append(self.model(xvb).argmax(1).cpu())
                     acc = (torch.cat(pred) == yv).float().mean().item() * 100
                 if acc > best_acc:
                     best_acc = acc
@@ -129,8 +139,8 @@ class IncrementalCloudLearner:
                                         generator=g)
                 else:
                     idx = batches[step - 1]
-                xb = x[idx].to(self.device)
-                yb = y[idx].to(self.device)
+                xb = dev_x[idx] if dev_x is not None else x[idx].to(self.device)
+                yb = dev_y[idx] if dev_y is not None else y[idx].to(self.device)
                 loss = F.cross_entropy(self.model(xb), yb)
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()

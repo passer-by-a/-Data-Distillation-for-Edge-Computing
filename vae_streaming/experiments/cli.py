@@ -43,6 +43,14 @@ def build_parser(default_scenario, default_methods):
                     help="从 stream_state.pt 断点续跑")
     ap.add_argument("--stop-after", type=int, default=None,
                     help="完成指定轮后保存断点并停止")
+    ap.add_argument("--kip-transfer-diag", action="store_true",
+                    help="KIP 只读诊断：记录编码器更新前后同一批验证图的 "
+                         "A/B/C 核分类，不改变训练行为")
+    ap.add_argument("--kip-cross-weight", type=float, default=None,
+                    help="kip_cross_version 的跨版本项权重（默认取预设 1.0）")
+    ap.add_argument("--representation", default=None, choices=["vae", "pixel"],
+                    help="特征表示：vae=潜空间（默认）；pixel=Base 标准化的"
+                         "原始像素（3072 维）")
     ap.add_argument("--quiet", action="store_true")
     return ap
 
@@ -74,7 +82,10 @@ def run_cli(default_scenario, default_methods):
     if args.vae_steps is not None:
         cfg["vae"]["steps_per_round"] = args.vae_steps
     if args.cloud_steps is not None:
+        # epochs_per_round > 0 时云端步数按 epoch 推导，会覆盖 steps_per_round；
+        # 显式指定 --cloud-steps 时清除它，避免参数静默失效
         cfg["cloud"]["steps_per_round"] = args.cloud_steps
+        cfg["cloud"]["epochs_per_round"] = 0
     if args.patch_fraction is not None:
         cfg["communication"]["patch_fraction"] = args.patch_fraction
     if args.quant is not None:
@@ -85,6 +96,13 @@ def run_cli(default_scenario, default_methods):
         cfg["cloud"]["head"] = args.head
     if args.tag:
         cfg["_run_tag"] = args.tag
+    if args.kip_transfer_diag:
+        cfg.setdefault("diagnostics", {})["kip_transfer"] = True
+    if args.kip_cross_weight is not None:
+        cfg.setdefault("distillation", {})["kip_cross_weight"] = float(
+            args.kip_cross_weight)
+    if args.representation is not None:
+        cfg["representation"] = args.representation
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]

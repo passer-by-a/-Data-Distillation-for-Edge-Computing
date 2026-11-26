@@ -8,6 +8,7 @@ import copy
 import numpy as np
 import torch
 from sklearn.cluster import KMeans
+from threadpoolctl import threadpool_limits
 
 from vae_bdm.baselines import allocate_quotas
 
@@ -27,7 +28,10 @@ def _select_class(z, q, method, seed, cfg):
         return z[sel], np.ones(q, dtype=np.int64)
     if method == "kmeans":
         km = KMeans(n_clusters=q, random_state=seed, n_init=1, max_iter=100)
-        km.fit(z.numpy())
+        # 单线程拟合：多线程归约顺序会让同一输入的质心在 1e-7 量级漂移，
+        # 导致同一 Base/seed 下各方法的初始代表无法逐位共享
+        with threadpool_limits(limits=1):
+            km.fit(z.numpy())
         # 保留真实簇大小：空簇记为 0，由下游按空槽处理（ExStream 优先填空槽，
         # Online K-means 的 1/count 学习率在内部对 0 取 max(·,1)）。
         sizes = np.bincount(km.labels_, minlength=q)

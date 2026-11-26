@@ -27,10 +27,10 @@ from ..communication.payload_accounting import (CommunicationLedger,
                                                 select_patch_indices)
 from ..communication.quantization import decode_features
 from ..data.causal_stream import CausalStream, regroup_stream_rounds
-from ..distillation.kip import KIPDistiller
+from ..distillation.kip import (KIPDistiller, krr_scores, median_sqdist)
 from ..distillation.margin_matching import MarginQuantileMatcher
 from ..distillation.moment_calibration import streaming_moment_calibrate
-from ..distillation.online_coreset import (build_coreset,
+from ..distillation.online_coreset import (GCRCoreset, build_coreset,
                                            coreset_from_state_dict)
 from ..distillation.streaming_dm import StreamingDM
 from ..memory.replay_buffer import (ClassBalancedReservoir,
@@ -42,6 +42,7 @@ from ..models.feature_alignment import (estimate_feature_alignment,
 from ..models.online_vae import (FeatureProtocol, build_vae, encode_mu,
                                  evaluate_vae, online_vae_update,
                                  snapshot_encoder, train_initial_vae)
+from ..models.pixel_protocol import PixelFeatureProtocol
 from ..models.pseudo_labeler import PSEUDO_SOURCE, FixedTeacher
 from ..config_utils import checkpoint_path, result_path
 
@@ -104,6 +105,15 @@ METHOD_OVERRIDES = {
         "alignment": {"method": "diagonal_affine"},
         "distillation": {"method": "exstream"},
         "communication": {"mode": "full_sync"}},
+    # GCR：真实潜特征候选池 + 梯度内积 facility-location 选择（潜特征版本，
+    # 论文原方法面向持续学习，这里不涉及像素/原始梯度）
+    "gcr": {
+        "vae": {"online_update": True, "replay_enabled": True,
+                "replay_ratio": 0.25},
+        "alignment": {"method": "diagonal_affine"},
+        "distillation": {"method": "gcr", "gcr_pool_mult": 4.0,
+                         "gcr_ridge": 1.0},
+        "communication": {"mode": "full_sync"}},
 }
 
 
@@ -124,6 +134,12 @@ for _name, _extra in {
 }.items():
     METHOD_OVERRIDES[_name] = deep_merge(
         METHOD_OVERRIDES["dm"], {"distillation": _extra})
+
+# KIP + 跨版本配对项：更新轮用旧代表对历史锚点的完整类别分数作教师，
+# 约束同一批图在新坐标下的 KIP 分数。lambda=0 时与普通 KIP 完全一致。
+METHOD_OVERRIDES["kip_cross_version"] = deep_merge(
+    METHOD_OVERRIDES["kip"],
+    {"distillation": {"method": "kip", "kip_cross_weight": 1.0}})
 
 # DM 结构对照：Residual DM 沿用它自己的特征映射，但 VAE/Alignment/目标集合
 # 与 81.11% 的 Plain DM（dm_r392u10）完全一致（reencode + lr1e-3 + cls0.1）
@@ -234,6 +250,13 @@ def _make_cloud_learner(cfg, dim, num_classes, device):
     if bool(cfg["cloud"].get("multi_branch", False)):
         return MultiBranchCloudLearner(cfg, dim, num_classes, device=device)
     return IncrementalCloudLearner(cfg, dim, num_classes, device=device)
+
+
+def _encode_images(images, pixel, protocol, vae, device):
+    """统一取特征：pixel 走固定像素变换，vae 走当前编码器 + 特征标准化。"""
+    if pixel:
+        return protocol(images)
+    return protocol.normalize(encode_mu(vae.encoder, images, device=device))
 
 
 def _seed_everything(seed):
@@ -410,7 +433,8 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
                     pending_vae=None, pending_rounds=None, reservoir=None,
                     latent_reservoir=None, teacher=None):
     torch.save({
-        "signature": signature, "vae": vae.state_dict(),
+        "signature": signature,
+        "vae": None if vae is None else vae.state_dict(),
         "teacher": teacher.state_dict() if teacher is not None else None,
         "teacher_version": int(teacher.version) if teacher is not None else 0,
         "version": int(version), "last_round": int(last_round),
@@ -466,6 +490,117 @@ def _save_diag_snapshot(path, *, round_idx, version, new_version, do_update,
     }, path)
 
 
+def _kip_transfer_prepare(prev_encoder, cur_encoder, val_images, val_labels,
+                          old_features, old_labels, old_sigma2, old_ridge,
+                          protocol, device, num_classes):
+    """只读诊断：编码器换版本前后，同一批验证图的核分类是否正确。
+
+    A 用旧代表 + 旧编码器特征；B/C 共用新编码器特征。这里只缓存两种
+    编码、算 A 的正确性，不改动 memory / VAE / RNG。
+    """
+    t0 = time.time()
+    with torch.no_grad():
+        old_q = protocol.normalize(
+            encode_mu(prev_encoder, val_images, device=device)).to(device)
+        new_q = protocol.normalize(
+            encode_mu(cur_encoder, val_images, device=device)).to(device)
+        old_f = old_features.float().to(device)
+        y = old_labels.long().to(device)
+        vy = val_labels.long().to(device)
+        sigma_src = "prev_round"
+        if old_sigma2 is None or not np.isfinite(float(old_sigma2)):
+            old_sigma2 = median_sqdist(old_f, old_q)
+            sigma_src = "median_old_reps_val"
+        pred = krr_scores(old_f, y, old_q, float(old_sigma2),
+                          float(old_ridge), int(num_classes)).argmax(1)
+        correct_a = pred.eq(vy)
+    return {"old_q": old_q, "new_q": new_q, "y": y, "vy": vy,
+            "old_sigma2": float(old_sigma2),
+            "old_ridge": float(old_ridge),
+            "sigma_source": sigma_src,
+            "correct_A": correct_a.detach().cpu(),
+            "sec": time.time() - t0}
+
+
+def _kip_transfer_predict(ctx, features, sigma2, ridge, num_classes):
+    """在同一批新编码验证图上，用给定代表集做核分类。"""
+    with torch.no_grad():
+        dev = ctx["y"].device
+        pred = krr_scores(features.float().to(dev), ctx["y"], ctx["new_q"],
+                          float(sigma2), float(ridge),
+                          int(num_classes)).argmax(1)
+        return pred.eq(ctx["vy"]).detach().cpu()
+
+
+def _kip_transfer_report(ctx, correct_b, correct_c, *, round_idx,
+                         version_from, version_to, sigma_c, ridge_c,
+                         alignment):
+    """A/B/C 三时点的配对准确率与逐图迁移计数（净损失单位：百分点）。"""
+    n = int(len(ctx["vy"]))
+    a, b, c = ctx["correct_A"], correct_b, correct_c
+
+    def _pair(x, y):
+        x_right_y_wrong = int((x & ~y).sum().item())
+        x_wrong_y_right = int((~x & y).sum().item())
+        return x_right_y_wrong, x_wrong_y_right
+
+    a2b, b2a = _pair(a, b)
+    a2c, c2a = _pair(a, c)
+    b2c, c2b = _pair(b, c)
+
+    def _acc(x):
+        return float(x.float().mean().item() * 100.0)
+
+    return {
+        "round": int(round_idx),
+        "version_from": int(version_from), "version_to": int(version_to),
+        "n_val": n,
+        "A_acc": _acc(a), "B_acc": _acc(b), "C_acc": _acc(c),
+        "A2B_loss_pp": 100.0 * (a2b - b2a) / n,
+        "A2C_loss_pp": 100.0 * (a2c - c2a) / n,
+        "B2C_loss_pp": 100.0 * (b2c - c2b) / n,
+        "counts": {"A2B": [a2b, b2a], "A2C": [a2c, c2a],
+                   "B2C": [b2c, c2b],
+                   "A_correct": int(a.sum().item()),
+                   "B_correct": int(b.sum().item()),
+                   "C_correct": int(c.sum().item())},
+        "sigma2_AB": ctx["old_sigma2"], "sigma2_C": float(sigma_c),
+        "sigma_source": ctx["sigma_source"],
+        "ridge_AB": ctx["old_ridge"], "ridge_C": float(ridge_c),
+        "align_relative_err": float(getattr(alignment, "relative_err", 0.0)),
+        "sec": float(ctx["sec"]),
+    }
+
+
+def _kip_cross_teacher(old_features, old_labels, anchor_old, anchor_new,
+                       anchor_labels, sigma2, ridge, num_classes, device):
+    """用旧代表 + 旧带宽，为“旧核分类器判对”的历史锚点生成教师分数。
+
+    返回 paired_features（新坐标）、target_scores（旧版本完整类别分数）
+    与覆盖统计；没有可保留锚点时返回 None（调用方退回普通 KIP）。
+    """
+    t0 = time.time()
+    with torch.no_grad():
+        support = old_features.float().to(device)
+        y = old_labels.long().to(device)
+        lab = anchor_labels.long().to(device)
+        scores = krr_scores(support, y, anchor_old.float().to(device),
+                            float(sigma2), float(ridge), int(num_classes))
+        keep = scores.argmax(1).eq(lab)
+        n_keep = int(keep.sum().item())
+        if n_keep == 0:
+            return None
+        # anchor_new 在 CPU，keep 在 device：分别用对应设备索引
+        keep_cpu = keep.cpu()
+        paired = anchor_new[keep_cpu].detach().clone()
+        targets = scores[keep].detach().cpu().clone()
+        n_cls = int(torch.unique(anchor_labels[keep_cpu]).numel())
+    return {"paired_features": paired, "target_scores": targets,
+            "n_paired": n_keep, "n_paired_classes": n_cls,
+            "sigma2_teacher": float(sigma2), "ridge_teacher": float(ridge),
+            "sec": time.time() - t0}
+
+
 def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                stop_after=None, stream=None, snapshot_rounds=None):
     if method is not None and method not in METHOD_OVERRIDES:
@@ -484,13 +619,40 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     _seed_everything(int(seed))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     C = int(cfg["num_classes"])
-    dim = int(cfg["feature_dim"])
+    # 表示选项：vae=潜空间（默认）；pixel=Base 标准化的原始像素（3x32x32=3072）
+    representation = str(cfg.get("representation", "vae"))
+    if representation not in ("vae", "pixel"):
+        raise ValueError(
+            f"未知表示 {representation}；可选: vae / pixel")
+    pixel = representation == "pixel"
+    if pixel:
+        dim = PixelFeatureProtocol.dim
+        cfg["feature_dim"] = dim
+    else:
+        dim = int(cfg["feature_dim"])
     budget = int(cfg["memory"]["representative_budget"])
     vcfg = cfg["vae"]
     align_mode = cfg["alignment"]["method"]
     distill = cfg["distillation"]["method"]
     sync_mode = cfg["communication"]["mode"]
     quant_mode = cfg["communication"]["quantization"]
+    if pixel:
+        if align_mode == "reencode":
+            raise ValueError("pixel 表示坐标固定，不支持 reencode 对齐")
+        if distill not in ("dm", "exstream", "reservoir", "gcr"):
+            raise ValueError(
+                "pixel 表示目前只支持 dm（含 dm_multi）/ exstream / "
+                f"reservoir / gcr，实际 {distill}")
+        if (bool(cfg["distillation"].get("margin_auto_lambda", False))
+                or float(cfg["distillation"].get("margin_weight", 0.0)) > 0):
+            raise ValueError(
+                "pixel 表示没有编码器分类头，不支持分类间隔匹配"
+                "（margin_auto_lambda / margin_weight）")
+    if align_mode == "reencode" and sync_mode == "patch":
+        raise ValueError(
+            "reencode 对齐会重建全部代表特征（memory.submitted 全量刷新），"
+            "与 patch 增量同步组合会导致云端与边缘视图不一致；"
+            "请改用 full_sync 或 diagonal_affine")
     cloud_mode = "incremental" if cfg["cloud"].get(
         "incremental_training", True) else "scratch"
     patch_fraction = float(cfg["communication"].get("patch_fraction", 0.10))
@@ -505,7 +667,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     update_fraction = float(update_fraction)
     if not 0.0 < update_fraction <= 1.0:
         raise ValueError(f"update_fraction 必须在 (0,1]，实际 {update_fraction}")
-    vae_update = bool(vcfg.get("online_update", True))
+    # pixel 表示没有编码器，不存在在线 VAE 更新
+    vae_update = bool(vcfg.get("online_update", True)) and not pixel
     # 累积若干轮再做一次在线更新：小批量流式场景下避免反复看极少数样本
     update_every = max(1, int(vcfg.get("update_every_rounds", 1)))
     replay_enabled = bool(vcfg.get("replay_enabled", True))
@@ -520,6 +683,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     if label_mode not in ("supervised_stream", "unlabeled_after_base"):
         raise ValueError(f"未知标签协议: {label_mode}")
     unlabeled = label_mode == "unlabeled_after_base"
+    if pixel and unlabeled:
+        raise ValueError("pixel 表示没有编码器/Teacher，只支持 supervised_stream")
     pl_cfg = cfg.get("pseudo_labels", {}) or {}
     pseudo_threshold = float(pl_cfg.get("threshold", 0.9))
     if unlabeled:
@@ -534,13 +699,28 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     select_best_on_val = bool(cfg["cloud"].get("select_best_on_val", True))
     # 轮末评估与轮内选优解耦：验证特征每轮都编码，但只在训练结束后评估
     # 最终权重并写入 val_acc/val_f1，不参与任何模型选择或早停。
-    eval_val_each_round = bool(cfg.get("evaluation", {}).get(
-        "val_each_round", True))
+    # 兼容两种键名：YAML 中使用 evaluation.per_round
+    _ev = cfg.get("evaluation", {}) or {}
+    eval_val_each_round = bool(_ev.get("per_round",
+                                       _ev.get("val_each_round", True)))
     # DM 精确目标：每轮都用当前 encoder 重编码 replay+current 作为同一目标集合
     dm_exact = distill == "dm" and bool(
         cfg["distillation"].get("exact_target", False))
     # KIP 的 support 已是当前版本代表，目标集需与 DM 一致（replay+current）
     kip_exact = distill == "kip"
+    # 只读诊断：记录编码器更新前后同一批验证图的核分类变化，不影响训练
+    kip_transfer_diag = bool(
+        (cfg.get("diagnostics") or {}).get("kip_transfer", False))
+    if kip_transfer_diag and not kip_exact:
+        raise ValueError("diagnostics.kip_transfer 只适用于 distillation.method=kip")
+    # KIP 跨版本配对项的权重；0 表示与普通 KIP 完全一致
+    kip_cross_w = float(cfg["distillation"].get("kip_cross_weight", 0.0))
+    if kip_cross_w < 0:
+        raise ValueError("kip_cross_weight 不能为负")
+    if kip_cross_w > 0 and not kip_exact:
+        raise ValueError("kip_cross_weight 只适用于 distillation.method=kip")
+    if kip_cross_w > 0 and align_mode == "reencode":
+        raise ValueError("kip_cross_weight 暂不支持 reencode 对齐模式")
     signature = _state_signature(cfg, tag, seed)
 
     stream = _build_stream(cfg, stream)
@@ -549,7 +729,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             f"cfg.num_classes={C} 与数据集 {cfg['dataset']} 实际类别数 "
             f"{stream.num_classes} 不一致，拒绝运行")
     expected_dim = int(cfg["latent_dim"]) * 8 * 8
-    if int(cfg["feature_dim"]) != expected_dim:
+    if not pixel and int(cfg["feature_dim"]) != expected_dim:
         raise ValueError(
             f"cfg.feature_dim={cfg['feature_dim']} 与 EdgeVAE 潜空间展平维度 "
             f"{expected_dim} 不一致，拒绝运行")
@@ -559,6 +739,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     if verbose:
         print(f"[{tag}] {cfg['dataset']} {stream.scenario} "
               f"base={len(stream.base_indices)} rounds={stream.num_rounds} "
+              f"repr={representation} dim={dim} "
               f"budget={budget} align={align_mode} distill={distill} "
               f"sync={sync_mode} quant={quant_mode} seed={seed}", flush=True)
 
@@ -583,43 +764,65 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 f"断点数据流指纹 {saved_stream_sha1} 与当前数据流 "
                 f"{current_stream_sha1} 不一致，拒绝续跑；请换新 tag 从 Base 重跑")
     resuming = st is not None
+    # 各方法在 r0 起才切换为自己的初始代表表示；初始同步与初始云端头
+    # 一律使用公共 k-means 代表集，保证所有方法从同一初始点出发
+    pending_init_features = None
 
-    vae = build_vae(C, int(cfg["latent_dim"]), int(cfg["base_channels"]),
-                    seed=int(seed), device=device)
-    if resuming:
-        vae.load_state_dict(st["vae"])
-        base_log = copy.deepcopy(st["rounds_log"][0].get("base_vae_log", {}))
+    vae = None
+    if pixel:
+        # pixel 分支：不构建/训练 VAE，只用 Initial Base 拟合固定通道统计量
+        if resuming:
+            protocol = PixelFeatureProtocol(st["protocol_mean"],
+                                            st["protocol_std"])
+            base_log = copy.deepcopy(st["rounds_log"][0].get("base_vae_log", {}))
+        else:
+            protocol = PixelFeatureProtocol.fit(base.images)
+            base_log = {"representation": "pixel", "cached": False,
+                        "train_sec": 0.0, "n_base": int(len(base.labels)),
+                        "dim": int(dim), **protocol.meta()}
+            if verbose:
+                print(f"  [base pixel] mean="
+                      f"{[round(v, 4) for v in protocol.meta()['channel_mean']]} "
+                      f"std={[round(v, 4) for v in protocol.meta()['channel_std']]}",
+                      flush=True)
     else:
-        base_hash = hashlib.sha1(
-            json.dumps(base_sig, sort_keys=True).encode()).hexdigest()[:16]
-        base_ckpt = os.path.join(cfg["checkpoints_dir"], cfg["dataset"],
-                                 "base_vae",
-                                 f"base_{cfg['dataset']}_{base_hash}.pt")
-        cached = False
-        if bool(vcfg.get("cache_base", True)) and os.path.exists(base_ckpt):
-            obj = torch.load(base_ckpt, map_location=device, weights_only=True)
-            if obj.get("base_signature") == base_sig:
-                vae.load_state_dict(obj["model_state_dict"])
-                base_log = obj["base_log"]
-                base_log["cached"] = True
-                cached = True
-                if verbose:
-                    print(f"  [base VAE] 复用缓存 "
-                          f"{os.path.relpath(base_ckpt, os.getcwd())}",
-                          flush=True)
-        if not cached:
-            base_log = train_initial_vae(vae, base.images, base.labels, cfg,
-                                         device, verbose=verbose)
-            os.makedirs(os.path.dirname(base_ckpt), exist_ok=True)
-            torch.save({"model_state_dict": vae.state_dict(),
-                        "base_log": base_log, "base_signature": base_sig,
-                        "seed": int(seed),
-                        "accessible": "initial_base_only"}, base_ckpt)
-    vae.eval()
+        vae = build_vae(C, int(cfg["latent_dim"]), int(cfg["base_channels"]),
+                        seed=int(seed), device=device)
+        if resuming:
+            vae.load_state_dict(st["vae"])
+            base_log = copy.deepcopy(st["rounds_log"][0].get("base_vae_log", {}))
+        else:
+            base_hash = hashlib.sha1(
+                json.dumps(base_sig, sort_keys=True).encode()).hexdigest()[:16]
+            base_ckpt = os.path.join(cfg["checkpoints_dir"], cfg["dataset"],
+                                     "base_vae",
+                                     f"base_{cfg['dataset']}_{base_hash}.pt")
+            cached = False
+            if bool(vcfg.get("cache_base", True)) and os.path.exists(base_ckpt):
+                obj = torch.load(base_ckpt, map_location=device,
+                                 weights_only=True)
+                if obj.get("base_signature") == base_sig:
+                    vae.load_state_dict(obj["model_state_dict"])
+                    base_log = obj["base_log"]
+                    base_log["cached"] = True
+                    cached = True
+                    if verbose:
+                        print(f"  [base VAE] 复用缓存 "
+                              f"{os.path.relpath(base_ckpt, os.getcwd())}",
+                              flush=True)
+            if not cached:
+                base_log = train_initial_vae(vae, base.images, base.labels, cfg,
+                                             device, verbose=verbose)
+                os.makedirs(os.path.dirname(base_ckpt), exist_ok=True)
+                torch.save({"model_state_dict": vae.state_dict(),
+                            "base_log": base_log, "base_signature": base_sig,
+                            "seed": int(seed),
+                            "accessible": "initial_base_only"}, base_ckpt)
+        vae.eval()
 
-    # 固定 Teacher：Initial Base VAE 的完整快照，之后不再更新
-    teacher = FixedTeacher(vae, version=0)
-    if resuming:
+    # 固定 Teacher：Initial Base VAE 的完整快照，之后不再更新（pixel 无 Teacher）
+    teacher = None if pixel else FixedTeacher(vae, version=0)
+    if resuming and not pixel:
         if st.get("teacher") is not None:
             teacher.module.load_state_dict(st["teacher"])
             teacher.version = int(st.get("teacher_version", 0))
@@ -629,7 +832,11 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     quotas = allocate_quotas(base.labels.numpy(), budget, C)
     peak_gpu = 0.0
     if resuming:
-        protocol = FeatureProtocol(st["protocol_mean"], st["protocol_std"])
+        protocol = (PixelFeatureProtocol(st["protocol_mean"],
+                                         st["protocol_std"])
+                    if pixel
+                    else FeatureProtocol(st["protocol_mean"],
+                                         st["protocol_std"]))
         memory = RepresentativeMemory.from_state_dict(st["memory"])
         stats = StreamingStatistics.from_state_dict(st["statistics"])
         replay = ClassBalancedReservoir.from_state_dict(st["replay"])
@@ -638,7 +845,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         learner.load_state_dict(st["learner"])
         ledger = CommunicationLedger()
         ledger.entries = copy.deepcopy(st["ledger"])
-        if distill in ("kmeans", "exstream"):
+        if distill in ("kmeans", "exstream", "gcr"):
             if st.get("coreset") is None:
                 raise ValueError(f"断点缺少 {distill} coreset 状态")
             coreset = coreset_from_state_dict(st["coreset"], distill)
@@ -680,14 +887,18 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             torch.cuda.set_rng_state_all(st["cuda_rng"])
         np.random.set_state(st["np_rng"])
         peak_gpu = max(peak_gpu, float(st["peak_gpu"]))
-        vae.eval()
+        if vae is not None:
+            vae.eval()
         if verbose:
             print(f"  [resume] 从第 {start_round} 轮继续 "
                   f"(已完成 {start_round}/{stream.num_rounds})", flush=True)
     else:
-        base_raw = encode_mu(vae.encoder, base.images, device=device)
-        protocol = FeatureProtocol.fit(base_raw)
-        base_feats = protocol.normalize(base_raw)
+        if pixel:
+            base_feats = protocol(base.images)
+        else:
+            base_raw = encode_mu(vae.encoder, base.images, device=device)
+            protocol = FeatureProtocol.fit(base_raw)
+            base_feats = protocol.normalize(base_raw)
 
         memory = RepresentativeMemory(budget, C, quotas, dim)
         memory.initialize_from_features(
@@ -703,7 +914,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             int(cfg["memory"]["raw_replay_capacity"]), C,
             class_balanced=cfg["memory"].get("replay_strategy",
                                              "class_balanced") == "class_balanced",
-            seed=int(seed))
+            seed=int(seed),
+            allow_stream_ground_truth=not unlabeled)
         replay.add_batch(base.images, base.labels)
 
         coreset = None
@@ -713,6 +925,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             coreset = build_coreset(distill, memory.features, memory.labels,
                                     quotas, dim=dim, seed=int(seed),
                                     initial_counts=memory.cluster_counts)
+        elif distill == "gcr":
+            # GCR 在 Base 真实特征上建立候选池，并选出真实样本作为初始代表
+            # （不使用 k-means 质心）；但该表示从 r0 起才生效，初始同步仍用
+            # 公共 k-means 代表集
+            coreset = GCRCoreset(
+                base_feats, base.labels, quotas, dim=dim, seed=int(seed),
+                pool_mult=float(cfg["distillation"].get("gcr_pool_mult", 4.0)),
+                ridge=float(cfg["distillation"].get("gcr_ridge", 1.0)))
+            pending_init_features = coreset.features.clone()
 
         # Online Reservoir 基线：与代表集同预算的类平衡原始样本缓冲，
         # 初始内容取自 Initial Base Set，代表特征由当前 Encoder 精确重编码
@@ -721,7 +942,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         reservoir_slots = None
         if distill in ("reservoir", "reservoir_latent"):
             reservoir = ClassBalancedReservoir(
-                budget, C, class_balanced=True, seed=int(seed) + 13)
+                budget, C, class_balanced=True, seed=int(seed) + 13,
+                allow_stream_ground_truth=not unlabeled)
             reservoir.caps = [int(q) for q in quotas]
             reservoir.add_batch(base.images, base.labels)
             r_imgs, r_labels = reservoir.get()
@@ -731,8 +953,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                     f"Reservoir 初始内容与代表集不一致: "
                     f"n={len(r_labels)} budget={budget}")
             if distill == "reservoir_latent":
-                # 初始潜变量选取完成后即可丢掉原始图像缓冲
-                memory.features = protocol.normalize(
+                # 初始潜变量选取完成后即可丢掉原始图像缓冲；该表示从 r0 起
+                # 才生效，初始同步仍用公共 k-means 代表集
+                pending_init_features = protocol.normalize(
                     encode_mu(vae.encoder, r_imgs, device=device)).clone()
                 base_seen = reservoir.seen.copy()
                 reservoir = None
@@ -760,15 +983,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         if not init_verify["all_ok"]:
             raise RuntimeError(f"初始同步不一致: {init_verify}")
 
-        if save:
+        if save and not pixel:
             _save_vae_ckpt(ckpt0, vae, 0, tag, seed, -1,
                            int(len(base.labels)), stream)
 
-        val_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if eval_val_each_round else None
-        test_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.test_images, device=device))
+        val_feats = (_encode_images(stream.val_images, pixel, protocol, vae,
+                                    device)
+                     if eval_val_each_round else None)
+        test_feats = _encode_images(stream.test_images, pixel, protocol, vae,
+                                    device)
         cloud_init = learner.update(cloud.features, cloud.labels,
                                     val_feats if select_best_on_val else None,
                                     stream.val_labels if select_best_on_val
@@ -787,6 +1010,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         initial_record = {
             "round": -1, "encoder_version": 0,
+            "representation": representation, "feature_dim": int(dim),
             "base_vae_log": base_log,
             "feat_norm_protocol": protocol.meta(),
             "memory": memory.summary(stats),
@@ -802,11 +1026,18 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "sync_verify": init_verify,
             "label_mode": label_mode,
             "pseudo_threshold": pseudo_threshold if unlabeled else None,
-            "teacher_fingerprint": teacher.fingerprint(),
+            "teacher_fingerprint": (teacher.fingerprint()
+                                    if teacher is not None else None),
             "stream_sha1": stream.stream_indices_sha1(),
-            "encoder_sha1": _encoder_sha1(vae.encoder),
+            "encoder_sha1": ("pixel" if pixel
+                             else _encoder_sha1(vae.encoder)),
         }
         rounds_log = [initial_record]
+        if pending_init_features is not None:
+            # 初始记录（指标、云端头权重）基于公共代表集，此处再切换到该
+            # 方法自己的初始代表表示，从 r0 起生效
+            memory.update_features(np.arange(budget), pending_init_features,
+                                   0, -1)
         edge_sec = base_log["train_sec"]
         # 让在线阶段的随机性独立于 base 权重是否来自缓存
         _seed_everything(int(seed) + 1_000_003)
@@ -855,7 +1086,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             torch.cuda.reset_peak_memory_stats()
         tr = time.time()
         current = stream.round(t)
-        prev_encoder = snapshot_encoder(vae, version)
+        prev_encoder = (None if pixel
+                        else snapshot_encoder(vae, version))
         # 无标签协议：只在当前轮生成一次伪标签，四种方法共享同一结果
         cur_labels = None
         pseudo = None
@@ -925,12 +1157,16 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             edge_sec += vae_sec
             pending_vae = None
             pending_rounds = []
-        vae.eval()
+        if not pixel:
+            vae.eval()
         new_version = version + 1 if do_update else version
 
         # ---------------- Anchors / Drift / Alignment ----------------
         anchors_img, anchors_y = replay.get()
-        if len(anchors_img) == 0:
+        anchor_is_history = len(anchors_img) > 0
+        n_old = n_new = None
+        if not anchor_is_history:
+            # 空回放时允许用当前批次做几何对齐，但它不是历史教师样本
             anchors_img = current.images
             anchors_y = pseudo.pseudo_labels if unlabeled else cur_labels
         n_a = min(anchor_count, len(anchors_img))
@@ -939,7 +1175,14 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         anchors_img, anchors_y = anchors_img[sel], anchors_y[sel]
         n_a = len(sel)
         ta = time.time()
-        if n_a == 0:
+        if pixel:
+            # 像素坐标固定：无编码器漂移，也不需要跨版本对齐
+            anchor_drift = {"mse": 0.0, "relative": 0.0,
+                            "relative_norm": 0.0, "cosine": 1.0,
+                            "n_anchors": int(n_a)}
+            alignment = identity_alignment(dim, version, new_version)
+            align_sec = time.time() - ta
+        elif n_a == 0:
             anchor_drift = {"mse": 0.0, "relative": 0.0,
                             "relative_norm": 0.0, "cosine": 1.0,
                             "n_anchors": 0}
@@ -973,8 +1216,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         # ---------------- 当前轮特征 ----------------
         te = time.time()
-        cur_raw = encode_mu(vae.encoder, current.images, device=device)
-        cur_feats = protocol.normalize(cur_raw)
+        cur_feats = _encode_images(current.images, pixel, protocol, vae, device)
         # 类别条件目标（统计 / K-means / DM / Reservoir 共用）：
         #   监督协议  → 全部当前真实标签
         #   无标签协议 → 仅高置信度伪标签样本；低置信样本只参与 VAE 无监督训练
@@ -995,11 +1237,11 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                         or (do_update and align_mode == "reencode"))
         rep_feats_reenc = None
         if need_rep_now and len(rep_imgs) > 0:
-            rep_feats_reenc = protocol.normalize(
-                encode_mu(vae.encoder, rep_imgs, device=device))
+            rep_feats_reenc = _encode_images(rep_imgs, pixel, protocol, vae,
+                                             device)
         encode_sec = time.time() - te
 
-        if t in snapshot_set:
+        if t in snapshot_set and not pixel:
             _save_diag_snapshot(
                 os.path.join(os.path.dirname(state_path),
                              f"diag_snapshot_r{t}.pt"),
@@ -1092,6 +1334,15 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 distill_info = {"method": distill,
                                 "init": "reencode_rebuild",
                                 "target_scope": "replay_plus_current"}
+            elif distill == "gcr":
+                coreset = GCRCoreset(
+                    all_f, all_y, quotas, dim=dim, seed=int(seed),
+                    pool_mult=float(cfg["distillation"].get(
+                        "gcr_pool_mult", 4.0)),
+                    ridge=float(cfg["distillation"].get("gcr_ridge", 1.0)))
+                memory.features = coreset.features.clone()
+                distill_info = {"method": "gcr", "init": "reencode_rebuild",
+                                "target_scope": "replay_plus_current"}
             elif distill == "dm":
                 sdm = StreamingDM(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
@@ -1118,8 +1369,34 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             else:
                 distill_info = {"method": "reencode"}
         else:
+            kip_diag_ctx = None
+            kip_cross_ctx = None
+            _prev_distill = (rounds_log[-1].get("distill") or {})
+            _prev_sigma2 = _prev_distill.get("sigma2")
+            _prev_ridge = float(_prev_distill.get(
+                "ridge", cfg["distillation"].get("kip_ridge", 0.01)))
+            if (kip_transfer_diag and kip_exact and do_update
+                    and new_version > version):
+                kip_diag_ctx = _kip_transfer_prepare(
+                    prev_encoder, vae.encoder, stream.val_images,
+                    stream.val_labels, memory.features, memory.labels,
+                    _prev_sigma2, _prev_ridge, protocol, device, C)
+            # 跨版本教师只在更新轮、监督流、有真实历史锚点且上一轮带宽
+            # 合法时启用；空回放（当前批次冒充锚点）时直接走普通 KIP
+            if (kip_exact and kip_cross_w > 0 and do_update
+                    and new_version > version and not unlabeled
+                    and anchor_is_history and n_old is not None
+                    and _prev_sigma2 is not None
+                    and np.isfinite(float(_prev_sigma2))):
+                kip_cross_ctx = _kip_cross_teacher(
+                    memory.features, memory.labels, n_old, n_new, anchors_y,
+                    _prev_sigma2, _prev_ridge, C, device)
             if new_version > version:
                 memory.align(alignment)
+            if kip_diag_ctx is not None:
+                kip_diag_ctx["correct_B"] = _kip_transfer_predict(
+                    kip_diag_ctx, memory.features, kip_diag_ctx["old_sigma2"],
+                    kip_diag_ctx["old_ridge"], C)
             if distill == "dm":
                 if rep_feats_reenc is not None:
                     real_f = torch.cat([rep_feats_reenc, cur_cls_f], 0)
@@ -1156,11 +1433,35 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                 kd = KIPDistiller(memory.features, memory.labels,
                                   memory.quotas, cfg["distillation"],
                                   seed=int(seed), device=device)
-                out = kd.update(allowed_idx=opt_idx, round_idx=t,
-                                real_features=real_f, real_labels=real_y)
+                out = kd.update(
+                    allowed_idx=opt_idx, round_idx=t,
+                    real_features=real_f, real_labels=real_y,
+                    paired_features=(None if kip_cross_ctx is None
+                                     else kip_cross_ctx["paired_features"]),
+                    target_scores=(None if kip_cross_ctx is None
+                                   else kip_cross_ctx["target_scores"]),
+                    cross_weight=kip_cross_w)
                 memory.features = out["features"]
                 distill_info = {**out["info"], "target_scope": target_scope,
                                 "n_target": int(len(real_y))}
+                if kip_cross_ctx is not None:
+                    distill_info["kip_cross"] = {
+                        "weight": kip_cross_w,
+                        "n_paired": kip_cross_ctx["n_paired"],
+                        "n_paired_classes": kip_cross_ctx["n_paired_classes"],
+                        "teacher_sigma2": kip_cross_ctx["sigma2_teacher"],
+                        "teacher_ridge": kip_cross_ctx["ridge_teacher"],
+                        "sec": kip_cross_ctx["sec"]}
+                if kip_diag_ctx is not None:
+                    _correct_c = _kip_transfer_predict(
+                        kip_diag_ctx, memory.features, out["info"]["sigma2"],
+                        out["info"]["ridge"], C)
+                    distill_info["kip_transfer"] = _kip_transfer_report(
+                        kip_diag_ctx, kip_diag_ctx["correct_B"], _correct_c,
+                        round_idx=t, version_from=version,
+                        version_to=new_version,
+                        sigma_c=out["info"]["sigma2"],
+                        ridge_c=out["info"]["ridge"], alignment=alignment)
             elif distill in ("kmeans", "exstream"):
                 if new_version > version:
                     coreset.align(alignment)
@@ -1178,11 +1479,27 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                     distill_info = {"method": distill,
                                     "skipped": "no_accepted_pseudo",
                                     "label_source": label_source}
+            elif distill == "gcr":
+                if new_version > version:
+                    coreset.align(alignment)
+                if n_cur_cls > 0:
+                    res = coreset.update(cur_cls_f, cur_cls_y, round_idx=t,
+                                         allowed_idx=opt_idx)
+                    memory.features = res["features"].clone()
+                    distill_info = {**res["info"],
+                                    "label_source": label_source}
+                else:
+                    memory.features = memory.features.clone()
+                    distill_info = {"method": "gcr",
+                                    "skipped": "no_accepted_pseudo",
+                                    "label_source": label_source}
             elif distill == "moment":
                 feats, minfo = streaming_moment_calibrate(
                     memory.features, memory.labels, stats,
                     allowed_idx=opt_idx, round_idx=t,
-                    max_scale=float(cfg["distillation"].get("max_scale", 3.0)))
+                    max_scale=float(cfg.get("alignment", {}).get(
+                        "max_scale",
+                        cfg["distillation"].get("max_scale", 3.0))))
                 memory.features = feats
                 distill_info = minfo
             elif distill == "reservoir":
@@ -1194,7 +1511,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             label_source=PSEUDO_SOURCE)
                 else:
                     reservoir.add_batch(current.images, cur_labels,
-                                        round_idx=t)
+                                        round_idx=t, source="stream",
+                                        label_source="ground_truth")
                 r_imgs, r_labels = reservoir.get()
                 if len(r_labels) != budget:
                     raise RuntimeError(
@@ -1204,9 +1522,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                                  memory.labels.cpu()):
                     raise RuntimeError(
                         "Reservoir 类别位置与代表特征标签不一致")
-                # 用当前 Encoder 精确重编码缓冲内容：无质心/无梯度优化
-                memory.features = protocol.normalize(
-                    encode_mu(vae.encoder, r_imgs, device=device)).clone()
+                # 用当前 Encoder 精确重编码缓冲内容（pixel：固定标准化）；无质心/无梯度优化
+                memory.features = _encode_images(r_imgs, pixel, protocol, vae,
+                                                 device).clone()
                 distill_info = {"method": "reservoir",
                                 "n_buffer": int(len(r_labels)),
                                 "per_class": reservoir.per_class_counts(),
@@ -1246,7 +1564,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # 无标签协议：Replay 只保存 Initial Base 的真实有标签样本，
         # 流式图像只保留在 pending 窗口（不写入 Replay，不扩预算）
         if replay_enabled and not unlabeled:
-            replay.add_batch(current.images, cur_labels, round_idx=t)
+            replay.add_batch(current.images, cur_labels, round_idx=t,
+                             source="stream", label_source="ground_truth")
         replay.assert_capacity()
 
         # ---------------- 同步 ----------------
@@ -1265,7 +1584,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         verify = cloud.verify_consistent(memory)
         if not verify["all_ok"]:
             raise RuntimeError(f"第 {t} 轮同步不一致: {verify}")
-        if patch_idx is not None and opt_idx is None:
+        if patch_idx is not None:
+            # 统计所有未上传槽位（含被优化过但未上传的），否则 partial
+            # update 下该指标会被恒置为 0
             mask = torch.ones(budget, dtype=torch.bool)
             mask[torch.from_numpy(np.asarray(patch_idx))] = False
             d = (memory.features[mask] - memory.submitted[mask]).abs()
@@ -1278,11 +1599,11 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # ---------------- 云端训练与评估 ----------------
         te = time.time()
         # 无标签协议关闭基于独立验证集的逐轮模型选择，只做固定步数训练
-        val_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.val_images, device=device)) \
-            if eval_val_each_round else None
-        test_feats = protocol.normalize(
-            encode_mu(vae.encoder, stream.test_images, device=device))
+        val_feats = (_encode_images(stream.val_images, pixel, protocol, vae,
+                                    device)
+                     if eval_val_each_round else None)
+        test_feats = _encode_images(stream.test_images, pixel, protocol, vae,
+                                    device)
         eval_encode_sec = time.time() - te
         cloud_info = learner.update(cloud.features, cloud.labels,
                                     val_feats if select_best_on_val else None,
@@ -1300,8 +1621,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             level = stream.round_domain_level(t)
             dom_x, dom_y = stream.test_domain(level)
             te = time.time()
-            dom_f = protocol.normalize(
-                encode_mu(vae.encoder, dom_x, device=device))
+            dom_f = _encode_images(dom_x, pixel, protocol, vae, device)
             eval_encode_sec += time.time() - te
             dm_met = learner.evaluate(dom_f, dom_y)
             group_metrics["current_domain"] = {"acc": dm_met["acc"],
@@ -1376,7 +1696,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                  pseudo.accept).sum()) else None
                             for c in range(C)]}
                        if unlabeled else None),
-            "encoder_sha1": _encoder_sha1(vae.encoder),
+            "encoder_sha1": ("pixel" if pixel
+                             else _encoder_sha1(vae.encoder)),
             "memory_sha1": _tensor_sha1(memory.features),
             "cloud_param_sha1": _module_sha1(learner.model),
             "n_cumulative_seen": int(len(base.labels) + sum(
@@ -1415,7 +1736,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # 只在 Encoder 真正更新时写盘，避免轮次间用同一版本号反复覆盖
         n_seen_so_far = int(len(base.labels) + sum(
             len(stream.round_indices[r]) for r in range(t + 1)))
-        if save and do_update:
+        if save and do_update and not pixel:
             ck = checkpoint_path(
                 cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
                      f"vae_v{new_version}.pt")
@@ -1456,7 +1777,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     n_seen_final = int(len(base.labels) + sum(
         len(stream.round_indices[r]) for r in range(completed_rounds)))
     pending_leftover = int(len(pending_vae[0])) if pending_vae else 0
-    if save:
+    ck = None
+    if save and not pixel:
         # 部分运行（stop_after / 中断）不得命名为 final，避免被当成完整结果
         ck_name = "vae_partial.pt" if partial else "vae_final.pt"
         ck = checkpoint_path(
@@ -1477,8 +1799,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     edge_sync_sec = float(sum((r.get("sync") or {}).get("sec", 0.0) for r in rl))
     eval_encode_sec = float(sum(r.get("eval_encode_sec", 0.0) or 0.0 for r in rl))
     int8_eval_sec = float(sum(r.get("test_int8_sec", 0.0) or 0.0 for r in rl))
-    base_train_sec = float(rounds_log[0].get("base_vae_log", {}).get(
-        "train_sec", 0.0))
+    base_log = rounds_log[0].get("base_vae_log", {}) or {}
+    # 命中缓存的 Base VAE 本次并未训练，不计入边缘计算耗时
+    base_train_sec = 0.0 if base_log.get("cached") else float(
+        base_log.get("train_sec", 0.0))
     edge_compute_sec = (base_train_sec + edge_vae_sec + edge_encode_sec +
                         edge_align_sec + edge_stats_sec + edge_distill_sec +
                         edge_sync_sec)
@@ -1506,11 +1830,14 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "update_fraction": update_fraction,
         "patch_fraction": patch_fraction if sync_mode == "patch" else 1.0,
         "n_reps": budget, "dim": dim,
+        "representation": representation,
         # ---------------- 无标签协议审计 ----------------
         "label_mode": label_mode,
         "pseudo_threshold": pseudo_threshold if unlabeled else None,
-        "teacher_fingerprint": teacher.fingerprint(),
-        "teacher_version": int(teacher.version),
+        "teacher_fingerprint": (teacher.fingerprint()
+                                if teacher is not None else None),
+        "teacher_version": (int(teacher.version)
+                            if teacher is not None else None),
         "teacher_label_source": (PSEUDO_SOURCE if unlabeled else None),
         "stream_sha1": stream.stream_indices_sha1(),
         "base_indices_sha1": stream.base_indices_sha1(),
@@ -1579,7 +1906,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "final_local_unsynced_max": final.get("sync", {}).get(
             "local_unsynced", {}).get("max"),
         "test_int8_note": final.get("test_int8_note"),
-        "ckpt_initial": ckpt0,
+        "ckpt_initial": ckpt0 if not pixel else None,
     }
     result = {
         "summary": summary,

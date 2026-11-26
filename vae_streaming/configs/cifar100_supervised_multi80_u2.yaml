@@ -1,5 +1,5 @@
 # 第二阶段监督流式协议（CIFAR-100，80 轮口径）
-#   Initial Base 9801 + Streaming 39200（80 轮 × 490，预算 980）
+#   Initial Base 9801 + Streaming 39199（80 轮，490/489 混合，严格不重叠）
 #   与 cifar10_supervised_multi80_u2.yaml 同协议，仅 dataset/num_classes 不同
 #   （流式真实标签可见；不覆盖任何旧配置或旧结果）
 protocol_version: vae_streaming_v2_supervised80_c100
@@ -13,7 +13,7 @@ base_channels: 64
 
 stream:
   scenario: iid
-  initial_fraction: 0.20          # base 9801 / 流式 39200
+  initial_fraction: 0.20          # base 9801 / 流式 39199（490/489 混合）
   num_rounds: 80                  # 每轮 490
   shuffle_seed: 42
   class_balanced_initial: true

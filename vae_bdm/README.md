@@ -100,7 +100,8 @@ CIFAR-100 把配置换成 `cifar100_v2.yaml`，高压缩比用 `20,50,100`。
 协议：冻结 EdgeVAE 的确定性 `mu` → 1024 维；云端 MLP（1024-512-C）；
 AdamW `lr=1e-3`、200 epoch、3 个云端种子（0/1/2）；测试集只做最终评估。
 原版 DM 跑 3 个蒸馏种子（42/43/44），表中 `±` 为蒸馏种子间标准差；
-基线为云端种子标准差。结果在 `results/v2/`，`protocol_version=vae_bdm_v2`。
+基线为云端种子标准差。结果在 `results/` 下的
+`*_baselines_r10.json`、`*_sweep.json`、`*_quant.json`，`protocol_version=vae_bdm_v2`。
 
 ### 5.1 CIFAR-10，10:1（M=4900）
 

@@ -108,7 +108,9 @@ def estimate_feature_alignment(prev_encoder, current_encoder, anchor_images,
     anchor_images 必须来自 Replay Memory（历史图像），不得包含未来数据。
     protocol 给出时，在**归一化特征空间**拟合；该空间与代表集/统计记忆一致。
     """
-    old_raw = encode_mu(prev_encoder.module, anchor_images, device=device)
+    # 兼容裸模型与 DataParallel/compile 包装
+    prev_model = getattr(prev_encoder, "module", prev_encoder)
+    old_raw = encode_mu(prev_model, anchor_images, device=device)
     new_raw = encode_mu(current_encoder, anchor_images, device=device)
     if protocol is not None:
         z_old = protocol.normalize(old_raw).double()
@@ -139,11 +141,12 @@ def estimate_feature_alignment(prev_encoder, current_encoder, anchor_images,
         fit_mask = _per_class_fit_mask(y_all)
     else:
         fit_mask = torch.zeros(n, dtype=torch.bool)
-        fit_mask[: n // 2] = True
+        fit_mask[::2] = True
     if not bool(fit_mask.any()) or bool(fit_mask.all()):
-        # 每类只有 1 个锚点时无法类内划分，退回简单对半切
+        # 每类只有 1 个锚点时无法类内划分；按全局交替切分，
+        # 避免只用排序靠前的类别拟合
         fit_mask = torch.zeros(n, dtype=torch.bool)
-        fit_mask[: n // 2] = True
+        fit_mask[::2] = True
     n_fit = int(fit_mask.sum())
     zo, zn = z_old[fit_mask], z_new[fit_mask]
     zo_h, zn_h = z_old[~fit_mask], z_new[~fit_mask]

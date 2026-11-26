@@ -8,7 +8,9 @@ from collections import defaultdict
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ORDER = ["online_kmeans", "online_moment", "dm"]
+ORDER = ["dm", "dm_multi", "online_kmeans", "online_moment",
+         "online_reservoir", "online_reservoir_latent", "kip", "exstream",
+         "gcr"]
 
 
 def load_all(results_dir):
@@ -35,7 +37,9 @@ def _ms(vals):
     vals = [v for v in vals if v is not None and np.isfinite(v)]
     if not vals:
         return None
-    return float(np.mean(vals)), float(np.std(vals))
+    # 与 summarize_rerun80 一致：多种子用样本标准差(ddof=1)
+    ddof = 1 if len(vals) > 1 else 0
+    return float(np.mean(vals)), float(np.std(vals, ddof=ddof))
 
 
 def _fmt(ms, nd=2):
@@ -108,13 +112,14 @@ def write_markdown(objs, out_path, dataset="cifar100", rounds=5, note=None):
             f"{_fmt(r['var_ratio'], 3)} | {_fmt(r['align_err'], 3)} |")
     ab = [r for r in aggregate(objs, "iid") if r["method"] not in ORDER]
     if ab:
-        lines += ["", "## 1b. 消融（单种子 42）", "",
-                  "| 方法 | 最终 | 在线平均 | 累计通信 | 预算 |",
-                  "|---|---|---|---|---|"]
+        seeds_txt = "单种子" if ab[0]["seeds"] == 1 else f"{ab[0]['seeds']} 种子"
+        lines += ["", f"## 1b. 消融（{seeds_txt}）", "",
+                  "| 方法 | 最终 | 在线平均 | INT8 | 累计通信 | 预算 |",
+                  "|---|---|---|---|---|---|"]
         for r in ab:
             lines.append(f"| {r['method']} | {_fmt(r['final'])} | "
-                         f"{_fmt(r['online'])} | {r['comm_kb']:.0f} KB | "
-                         f"{r['n_reps']} |")
+                         f"{_fmt(r['online'])} | {_fmt(r['int8'])} | "
+                         f"{r['comm_kb']:.0f} KB | {r['n_reps']} |")
     ls = aggregate(objs, "label_shift")
     lines += ["", "## 2. Label Shift", "",
               "| 方法 | 最终 | 当前类 | 历史类 | 累计通信 |", "|---|---|---|---|---|"]

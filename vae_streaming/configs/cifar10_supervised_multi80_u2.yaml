@@ -1,6 +1,8 @@
 # 第二阶段监督流式协议（80 轮口径）
 #   Initial Base 9800 + Streaming 39200（80 轮 × 490）
-#   与 cifar10_unlabeled_multi80_u2.yaml 唯一的区别：label_mode = supervised_stream
+#   与 cifar10_unlabeled_multi80_u2.yaml 的差异：label_mode、云端训练预算
+#   （epochs_per_round=5，约 20 步/轮 vs steps_per_round=200）与蒸馏器
+#   （Plain DM 单 MLP vs Multi-MLP 3 映射）
 #   （流式真实标签可见，用于监督上界参考；不覆盖任何旧配置或旧结果）
 protocol_version: vae_streaming_v2_supervised80
 dataset: cifar10
@@ -13,7 +15,7 @@ base_channels: 64
 
 stream:
   scenario: iid
-  initial_fraction: 0.20          # base 9800 / 流式 39200
+  initial_fraction: 0.20          # base 9800（每类 977-983，round(20%)）/ 流式 39200
   num_rounds: 80                  # 每轮 490
   shuffle_seed: 42
   class_balanced_initial: true

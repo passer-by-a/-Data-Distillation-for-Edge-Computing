@@ -1,7 +1,8 @@
 # 实验结果总结
 
 > 更新：2026-11-26。当前主结果只保留最新一轮 **80 轮、9 方法 × 3 种子**
-> （tag `sup80v2`）的 CIFAR-10 / CIFAR-100 IID 流式实验；
+> 的 CIFAR-10 / CIFAR-100 IID 流式实验（主体批次 `sup80v2`，
+> CIFAR-10 的 `dm_multi`/`gcr` 为 `sup80v3`）；
 > 更早的 5 轮 / 40 轮 / 392 轮、u2 无标签、label-shift 旧分组等实验产物已删除。
 
 ---
@@ -84,7 +85,9 @@
 
 ## 5. 第二阶段结果（80 轮，3 seeds，IID）
 
-> 逐种子明细：`vae_streaming/results/<dataset>/iid/*_sup80v2_seed{42,43,44}.json`。
+> 逐种子明细：`vae_streaming/results/<dataset>/iid/*_sup80v{2,3}_seed{42,43,44}.json`。
+> 批次：CIFAR-10 的 `dm_multi`/`gcr` 为 `sup80v3`，其余为 `sup80v2`；
+> Pixel 配对固定取 `sup80v3`（见 5.3）。
 > 汇总表：`results/cifar10/main_table_multi_seed_v2.md`、
 > `results/cifar100/main_table_multi_seed_v2.md`。
 
@@ -123,7 +126,12 @@
 1. **ExStream 在两个数据集上均为最优**：C10 81.07（+4.8）、C100 41.39（+13.0）。
 2. **CIFAR-10 第二梯队接近**：gcr、reservoir_latent、dm_multi、dm、kip 在 0.8 点内；
    CIFAR-100 上 DM 系（37.36 / 37.07）明显优于质心类方法（32–33）。
-3. **INT8 几乎无损**：所有方法 FP32 与 INT8 最终精度差 ≤ 0.3 点。
+3. **INT8 列的口径**：云端模型在 INT8 回传特征上训练，表内“INT8”是只把
+   测试输入再量化后的末轮结果。按 seed 平均，三种核心方法
+   （dm / exstream / online_reservoir）在两个数据集、两种表示上的末轮差
+   最大 0.04 pp（逐 seed 最大 0.08 pp）；其余方法差异更大
+   （C10 KIP 0.44、C100 KIP 0.48、
+   C100 K-means 0.65），不能概括为“所有方法 ≤0.3 点”。
 4. **通信完全相同**：full sync 980×1024×INT8，80 轮累计 80,498 KB，
    方法比较不掺杂通信预算差异。
 5. **初始点已统一**：所有方法共享同一 Initial Base VAE，
@@ -171,6 +179,15 @@ python -m vae_streaming.experiments.run_iid \
    covariate_shift 代码保留，但当前只报告 IID；引用前需重新运行。
 8. **GCR 数值已按修复后实现重跑**（`cov` 初值 0、分块相似度），
    与旧版结果不可直接混用。
+9. **边缘耗时不能直接作为冷启动横比**：`edge_total_sec` 在 Base 命中缓存时把
+   Base 训练记为 0，也不含 Base 特征生成与初始 K-Means；论文请分别报告
+   `edge_base_build_sec`（一次性 Base 构建）与 `edge_online_sec`（80 轮在线更新）。
+10. **KL 日志口径已修正**：旧版验证先沿通道求和再平均，与训练的全元素均值
+    相差 16 倍（16 个潜通道）；现已统一为 `.mean()`。旧 JSON 的 KL 曲线不能
+    直接与新结果比较，分类准确率不受影响。
+11. **重新运行时的路径**：pixel 结果写入 `results/<dataset>/pixel/...`，断点写入
+    `checkpoints/<dataset>/pixel/...`；VAE 保留旧路径以兼容历史结果。写入前会
+    检查已有文件/断点的表示，不一致时直接报错而不是静默覆盖。
 
 ---
 
@@ -180,7 +197,8 @@ python -m vae_streaming.experiments.run_iid \
 DM（Plain）、DM（Multi-MLP）、ExStream、GCR、Reservoir 五方法各 3 seeds；
 像素轨迹 tag `pix80v3`，VAE 轨迹 CIFAR-100 用 `sup80v2`、CIFAR-10 用 `sup80v3`。
 完整表格、自检与配对差见
-`vae_streaming/results/pixel_vs_vae_comparison.md`。
+`vae_streaming/results/pixel_vs_vae_comparison.md`，逐 seed 配对表见
+`vae_streaming/results/pixel_vs_vae_per_seed.md`。
 
 - 像素 Base 准确率 C10 33.95±0.23、C100 10.56±0.42，显著低于 VAE 的
   76.25±0.42 / 28.38±0.24；80 轮内五种方法平均只提升约 2.3–2.6 pp。
@@ -193,3 +211,11 @@ DM（Plain）、DM（Multi-MLP）、ExStream、GCR、Reservoir 五方法各 3 se
 - DM-Multi 与 Plain DM 在两个表示下差异均在约 1 pp 内。
 - 预算口径：固定 980 代表时像素每轮上传 3,010,560 B，为 VAE 1,003,520 B 的 3 倍；
   80 轮累计约 245 MB vs 82.4 MB（含标签与量化元数据）。
+- 逐 seed 配对（两侧 tag、末轮准确率、在线平均、配对差）由
+  `python -m vae_streaming.experiments.verify_pixel_vs_vae` 从本地 JSON 生成：
+  `vae_streaming/results/pixel_vs_vae_per_seed.md`。脚本同时校验
+  (dataset, method, representation, seed) 唯一性、Base 指纹、流指纹、
+  `round_sizes`、完成轮数与云端预算；三种核心方法在 42/43/44 上均完整配对。
+- 论文结论限定为：“在 980 个代表、每轮 5 个 epoch、当前云端 MLP 下，
+  监督 VAE 潜表示比固定标准化的展平 RGB 获得更高准确率。”该比较中两组
+  代表数量相同，但像素的特征载荷（3×32×32=3072）是 VAE（1024）的 3 倍。

@@ -431,9 +431,11 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
                     statistics, replay, cloud, learner, coreset, ledger,
                     rounds_log, edge_sec, peak_gpu, signature, wall_sec=0.0,
                     pending_vae=None, pending_rounds=None, reservoir=None,
-                    latent_reservoir=None, teacher=None):
+                    latent_reservoir=None, teacher=None,
+                    representation="vae", base_build_sec=0.0):
     torch.save({
         "signature": signature,
+        "representation": str(representation),
         "vae": None if vae is None else vae.state_dict(),
         "teacher": teacher.state_dict() if teacher is not None else None,
         "teacher_version": int(teacher.version) if teacher is not None else 0,
@@ -453,6 +455,7 @@ def _save_run_state(path, *, vae, version, last_round, protocol, memory,
         "ledger": copy.deepcopy(ledger.entries),
         "rounds_log": copy.deepcopy(rounds_log),
         "edge_sec": float(edge_sec), "peak_gpu": float(peak_gpu),
+        "base_build_sec": float(base_build_sec),
         "wall_sec": float(wall_sec),
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all()
@@ -601,6 +604,60 @@ def _kip_cross_teacher(old_features, old_labels, anchor_old, anchor_new,
             "sec": time.time() - t0}
 
 
+def _repr_relpath(rel, representation):
+    """把表示插入 {dataset}/{scenario}/ 之后。
+
+    VAE 保持历史路径以兼容已有结果与断点；pixel 使用独立子目录，
+    避免同方法/seed 在无 tag 时互相覆盖。
+    """
+    if representation == "vae":
+        return rel
+    parts = rel.split("/")
+    return "/".join([parts[0], representation] + parts[1:])
+
+
+def _state_representation(st):
+    """断点的表示：新状态读字段，旧状态按 protocol_mean 维度推断。"""
+    rep = st.get("representation")
+    if rep:
+        return str(rep)
+    pm = st.get("protocol_mean")
+    if pm is not None and int(pm.numel()) == 3:
+        return "pixel"
+    return "vae"
+
+
+def _check_result_representation(path, representation):
+    """写入前校验已有结果属于同一表示，禁止 Pixel/VAE 静默覆盖。"""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            old = json.load(f)
+    except Exception as exc:
+        raise ValueError(
+            f"结果文件 {path} 已存在且无法解析，拒绝覆盖: {exc}")
+    old_rep = ((old.get("summary") or {}).get("representation")
+               or (old.get("config") or {}).get("representation")
+               or "vae")
+    if str(old_rep) != representation:
+        raise ValueError(
+            f"结果文件 {path} 属于表示 {old_rep}，当前运行是 {representation}；"
+            "请换 tag 或显式清理旧文件，禁止静默覆盖")
+
+
+def _check_state_representation(path, representation):
+    """写入前校验已有断点属于同一表示。"""
+    if not os.path.exists(path):
+        return
+    st = torch.load(path, map_location="cpu", weights_only=False)
+    old_rep = _state_representation(st)
+    if old_rep != representation:
+        raise ValueError(
+            f"断点 {path} 属于表示 {old_rep}，当前运行是 {representation}；"
+            "请换 tag 或显式清理旧断点，禁止静默覆盖")
+
+
 def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                stop_after=None, stream=None, snapshot_rounds=None):
     if method is not None and method not in METHOD_OVERRIDES:
@@ -735,7 +792,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             f"{expected_dim} 不一致，拒绝运行")
     base_sig = _base_signature(cfg, seed, stream)
     ckpt0 = checkpoint_path(
-        cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt")
+        cfg, _repr_relpath(
+            f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/vae_v0.pt",
+            representation))
     if verbose:
         print(f"[{tag}] {cfg['dataset']} {stream.scenario} "
               f"base={len(stream.base_indices)} rounds={stream.num_rounds} "
@@ -746,12 +805,19 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
     t_start = time.time()
     base = stream.base
     state_path = checkpoint_path(
-        cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/stream_state.pt")
+        cfg, _repr_relpath(
+            f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/stream_state.pt",
+            representation))
     snapshot_set = set(int(r) for r in (snapshot_rounds or []))
     # 先探测断点：命中时跳过 base 训练、初始同步与初始云端训练
     st = None
     if resume and os.path.exists(state_path):
         st = torch.load(state_path, map_location="cpu", weights_only=False)
+        saved_repr = _state_representation(st)
+        if saved_repr != representation:
+            raise ValueError(
+                f"断点 {state_path} 属于表示 {saved_repr}，当前运行是 "
+                f"{representation}，拒绝续跑")
         if st["signature"] != signature:
             raise ValueError("断点状态与当前配置签名不一致，拒绝续跑")
         # 配置签名不含数据流实现：必须再核对首轮记录的数据流指纹，
@@ -760,14 +826,27 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         current_stream_sha1 = stream.stream_indices_sha1()
         if saved_stream_sha1 is not None and \
                 saved_stream_sha1 != current_stream_sha1:
-            raise ValueError(
-                f"断点数据流指纹 {saved_stream_sha1} 与当前数据流 "
-                f"{current_stream_sha1} 不一致，拒绝续跑；请换新 tag 从 Base 重跑")
+            # 旧断点的指纹不含轮边界，仅能按拼接索引核对；接受但提示
+            if saved_stream_sha1 == stream.stream_indices_sha1_legacy():
+                if verbose:
+                    print("  [resume] 旧断点流指纹不含轮边界，按兼容模式接受",
+                          flush=True)
+            else:
+                raise ValueError(
+                    f"断点数据流指纹 {saved_stream_sha1} 与当前数据流 "
+                    f"{current_stream_sha1} 不一致，拒绝续跑；请换新 tag 从 Base 重跑")
     resuming = st is not None
+    if not resuming and save:
+        # 全新运行即将写盘：旧路径上若已有另一种表示的断点则直接报错
+        _check_state_representation(state_path, representation)
     # 各方法在 r0 起才切换为自己的初始代表表示；初始同步与初始云端头
     # 一律使用公共 k-means 代表集，保证所有方法从同一初始点出发
     pending_init_features = None
 
+    # 一次性 Base 构建耗时（VAE 训练/像素统计 + Base 特征 + 初始 K-Means）；
+    # 续跑时不再重建，从断点恢复首次构建的耗时。
+    t_base_build = time.time()
+    base_build_sec = 0.0
     vae = None
     if pixel:
         # pixel 分支：不构建/训练 VAE，只用 Initial Base 拟合固定通道统计量
@@ -839,7 +918,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                                          st["protocol_std"]))
         memory = RepresentativeMemory.from_state_dict(st["memory"])
         stats = StreamingStatistics.from_state_dict(st["statistics"])
-        replay = ClassBalancedReservoir.from_state_dict(st["replay"])
+        replay = ClassBalancedReservoir.from_state_dict(
+            st["replay"], allow_stream_ground_truth=not unlabeled)
         cloud = CloudState.from_state_dict(st["cloud"])
         learner = _make_cloud_learner(cfg, dim, C, device)
         learner.load_state_dict(st["learner"])
@@ -854,7 +934,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         if distill == "reservoir":
             if st.get("reservoir") is None:
                 raise ValueError("断点缺少 reservoir 状态")
-            reservoir = ClassBalancedReservoir.from_state_dict(st["reservoir"])
+            reservoir = ClassBalancedReservoir.from_state_dict(
+                st["reservoir"], allow_stream_ground_truth=not unlabeled)
         else:
             reservoir = None
         if distill == "reservoir_latent":
@@ -875,6 +956,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             pending_rounds = list(range(int(st["last_round"]) - k + 1,
                                         int(st["last_round"]) + 1))
         edge_sec = float(st["edge_sec"])
+        base_build_sec = float(st.get("base_build_sec", 0.0))
         wall_sec = float(st.get("wall_sec", 0.0))
         version = int(st["version"])
         start_round = int(st["last_round"]) + 1
@@ -909,6 +991,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
 
         stats = StreamingStatistics(C, dim, version=0)
         stats.update(base_feats, base.labels, 0, round_idx=-1)
+        base_build_sec = time.time() - t_base_build
 
         replay = ClassBalancedReservoir(
             int(cfg["memory"]["raw_replay_capacity"]), C,
@@ -992,11 +1075,23 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                      if eval_val_each_round else None)
         test_feats = _encode_images(stream.test_images, pixel, protocol, vae,
                                     device)
+        # 初始拟合（base 代表集上的 epochs_per_round 个 epoch）也逐 epoch
+        # 只读评估，写入 initial_record，供 loss/accuracy 曲线使用
+        init_per_epoch = []
+
+        def _on_init_epoch_end(k, ep_loss):
+            em = learner.evaluate(test_feats, stream.test_labels)
+            init_per_epoch.append({"epoch": int(k) + 1,
+                                   "train_loss": float(ep_loss),
+                                   "test_loss": em.get("loss"),
+                                   "acc": em["acc"], "f1": em["f1"]})
+
         cloud_init = learner.update(cloud.features, cloud.labels,
                                     val_feats if select_best_on_val else None,
                                     stream.val_labels if select_best_on_val
                                     else None, round_idx=-1,
-                                    mode=cloud_mode)
+                                    mode=cloud_mode,
+                                    on_epoch_end=_on_init_epoch_end)
         init_metrics = learner.evaluate(test_feats, stream.test_labels)
         init_val = (learner.evaluate(val_feats, stream.val_labels)
                     if val_feats is not None else None)
@@ -1019,8 +1114,12 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "cloud": cloud_init,
             "cloud_param_sha1": _module_sha1(learner.model),
             "acc": init_metrics["acc"], "f1": init_metrics["f1"],
+            "test_loss": init_metrics.get("loss"),
+            "train_loss": cloud_init.get("train_loss"),
+            "per_epoch": init_per_epoch,
             "val_acc": init_val["acc"] if init_val else None,
             "val_f1": init_val["f1"] if init_val else None,
+            "val_loss": init_val.get("loss") if init_val else None,
             "cloud_branches": init_branches,
             "sync_bytes": size,
             "sync_verify": init_verify,
@@ -1058,7 +1157,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             pending_rounds=pending_rounds,
                             reservoir=reservoir,
                             latent_reservoir=latent_reservoir,
-                            teacher=teacher)
+                            teacher=teacher, representation=representation,
+                            base_build_sec=base_build_sec)
 
     # 统计来源（跨轮保持）：只有真正发生 reset 才降级，不因当前轮未更新而误标
     stats_origin = "aligned_full_history"
@@ -1605,11 +1705,27 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         test_feats = _encode_images(stream.test_images, pixel, protocol, vae,
                                     device)
         eval_encode_sec = time.time() - te
+        # 逐 epoch 只读评估：累计每轮每个 epoch 结束时的训练 CE 与测试集指标，
+        # 供 epoch 分辨率曲线使用（不参与训练、不改变 RNG 序列）
+        per_epoch = []
+        n_ep = int(getattr(learner, "epochs_per_round", 0) or 1)
+        # 初始拟合已记录的 epoch 数占横轴前段（epoch 1..base_ep）；
+        # 断点续跑时沿用断点里的初始记录，旧断点无 per_epoch 则为 0
+        base_ep = len(rounds_log[0].get("per_epoch") or []) if rounds_log else 0
+
+        def _on_epoch_end(k, ep_loss):
+            em = learner.evaluate(test_feats, stream.test_labels)
+            per_epoch.append({"epoch": int(base_ep + t * n_ep + k + 1),
+                              "train_loss": float(ep_loss),
+                              "test_loss": em.get("loss"),
+                              "acc": em["acc"], "f1": em["f1"]})
+
         cloud_info = learner.update(cloud.features, cloud.labels,
                                     val_feats if select_best_on_val else None,
                                     stream.val_labels if select_best_on_val
                                     else None, round_idx=t,
-                                    mode=cloud_mode)
+                                    mode=cloud_mode,
+                                    on_epoch_end=_on_epoch_end)
         met = learner.evaluate(test_feats, stream.test_labels)
         # 轮末评估（只读）：用训练结束后的最终权重评估验证集，不参与选优
         val_met = (learner.evaluate(val_feats, stream.val_labels)
@@ -1718,8 +1834,12 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             "cloud": cloud_info,
             "cloud_branches": cloud_branches,
             "acc": met["acc"], "f1": met["f1"],
+            "test_loss": met.get("loss"),
+            "train_loss": cloud_info.get("train_loss"),
+            "per_epoch": per_epoch,
             "val_acc": val_met["acc"] if val_met else None,
             "val_f1": val_met["f1"] if val_met else None,
+            "val_loss": val_met.get("loss") if val_met else None,
             "groups": group_metrics,
             "test_int8_acc": test_int8,
             "test_int8_sec": int8_sec,
@@ -1738,8 +1858,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
             len(stream.round_indices[r]) for r in range(t + 1)))
         if save and do_update and not pixel:
             ck = checkpoint_path(
-                cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
-                     f"vae_v{new_version}.pt")
+                cfg, _repr_relpath(
+                    f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
+                    f"vae_v{new_version}.pt", representation))
             _save_vae_ckpt(ck, vae, new_version, tag, seed, t, n_seen_so_far,
                            stream)
 
@@ -1766,7 +1887,8 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             pending_rounds=pending_rounds,
                             reservoir=reservoir,
                             latent_reservoir=latent_reservoir,
-                            teacher=teacher)
+                            teacher=teacher, representation=representation,
+                            base_build_sec=base_build_sec)
         if stop_after is not None and t >= int(stop_after):
             break
 
@@ -1782,8 +1904,9 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         # 部分运行（stop_after / 中断）不得命名为 final，避免被当成完整结果
         ck_name = "vae_partial.pt" if partial else "vae_final.pt"
         ck = checkpoint_path(
-            cfg, f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
-                 f"{ck_name}")
+            cfg, _repr_relpath(
+                f"{cfg['dataset']}/{stream.scenario}/seed{seed}/{tag}/"
+                f"{ck_name}", representation))
         _save_vae_ckpt(ck, vae, version, tag, seed, final_round, n_seen_final,
                        stream)
     accs = [r["acc"] for r in rounds_log[1:]]
@@ -1840,6 +1963,7 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
                             if teacher is not None else None),
         "teacher_label_source": (PSEUDO_SOURCE if unlabeled else None),
         "stream_sha1": stream.stream_indices_sha1(),
+        "stream_sha1_version": 2,
         "base_indices_sha1": stream.base_indices_sha1(),
         "n_vae_updates": int(sum(1 for r in rl if r.get("vae_updated"))),
         "vae_optimizer_steps": int(sum(
@@ -1879,7 +2003,14 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "edge_stats_sec": edge_stats_sec,
         "edge_distill_sec": edge_distill_sec,
         "edge_sync_sec": edge_sync_sec,
-        # edge_train_sec 只含 VAE 训练；edge_total_sec 为边缘侧计算总耗时
+        # 一次性 Base 构建耗时：Base VAE 训练/像素统计 + Base 特征 + 初始 K-Means
+        "edge_base_build_sec": base_build_sec,
+        # 80 轮在线更新耗时：不含 Base 构建，也不含评估/云端训练
+        "edge_online_sec": (edge_vae_sec + edge_encode_sec + edge_align_sec +
+                            edge_stats_sec + edge_distill_sec + edge_sync_sec),
+        # edge_train_sec 只含 VAE 训练；edge_total_sec 为旧口径边缘侧计算总耗时
+        # （Base 命中缓存时 base_train_sec 记为 0，不可用于跨方法冷启动对比）。
+        # 论文中请分别报告 edge_base_build_sec 与 edge_online_sec。
         "edge_train_sec": base_train_sec + edge_vae_sec,
         "edge_total_sec": edge_compute_sec,
         "eval_encode_sec_total": eval_encode_sec,
@@ -1917,8 +2048,10 @@ def run_method(cfg, method, seed=None, verbose=True, save=True, resume=False,
         "cloud_history": learner.history,
     }
     if save and not partial:
-        p = result_path(cfg, f"{cfg['dataset']}/{stream.scenario}/"
-                             f"{tag}_seed{seed}.json")
+        p = result_path(cfg, _repr_relpath(
+            f"{cfg['dataset']}/{stream.scenario}/{tag}_seed{seed}.json",
+            representation))
+        _check_result_representation(p, representation)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)

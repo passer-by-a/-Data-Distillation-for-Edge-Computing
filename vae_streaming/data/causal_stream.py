@@ -372,9 +372,18 @@ class CausalStream:
     # 审计
     # ------------------------------------------------------------------
     def stream_indices_sha1(self):
-        """流式数据流指纹（按轮次、按顺序）"""
+        """流式数据流指纹（含每轮边界，避免不同切分得到同一指纹）"""
+        h = hashlib.sha1(b"v2|")
+        for idx in self.round_indices:
+            arr = np.asarray(idx, dtype=np.int64)
+            h.update(np.int64(arr.size).tobytes())
+            h.update(arr.tobytes())
+        return h.hexdigest()[:16]
+
+    def stream_indices_sha1_legacy(self):
+        """旧版指纹：只哈希拼接后的索引，仅供旧断点兼容校验。"""
         h = hashlib.sha1()
-        for r, idx in enumerate(self.round_indices):
+        for idx in self.round_indices:
             h.update(np.asarray(idx, dtype=np.int64).tobytes())
         return h.hexdigest()[:16]
 
@@ -391,6 +400,7 @@ class CausalStream:
             "streaming_labels_sealed": self.label_mode ==
             "unlabeled_after_base",
             "stream_indices_sha1": self.stream_indices_sha1(),
+            "stream_sha1_version": 2,
             "base_indices_sha1": self.base_indices_sha1(),
             "scenario": self.scenario,
             "num_classes": self.num_classes,

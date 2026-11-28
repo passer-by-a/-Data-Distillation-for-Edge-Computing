@@ -163,7 +163,7 @@ GCR 实现说明：facility-location 增益初值从 0 开始（旧实现误用 
 ## 4. 运行
 
 ```bash
-# 单元测试（当前 52 passed, 1 skipped）
+# 单元测试（当前 63 passed, 1 skipped）
 python -m pytest vae_streaming/tests -q
 
 # CIFAR-10：80 轮监督流式，9 方法 × 3 种子
@@ -191,7 +191,9 @@ python -m vae_streaming.experiments.run_covariate_shift \
   --config vae_streaming/configs/cifar100_supervised_multi80_u2.yaml --seeds 42
 
 # 原始像素表示（representation=pixel）：跳过 VAE，特征为 3×32×32=3072 维
-# 标准化像素，云端 MLP 为 3072→512→类别数
+# 标准化像素，云端 MLP 为 3072→512→类别数。
+# 不传 --methods 时，pixel 默认只跑 dm,exstream,online_reservoir
+# （不支持 online_kmeans/online_moment/kip；显式传入会在启动时报错）。
 python -m vae_streaming.experiments.run_iid \
   --config vae_streaming/configs/cifar10_supervised_multi80_u2.yaml \
   --methods dm,dm_multi,exstream,gcr,online_reservoir \
@@ -211,16 +213,26 @@ python -m vae_streaming.experiments.run_offline_reference \
 
 ## 5. 结果
 
-> 全部数字来自实际运行（tag `sup80v2`，80 轮，种子 42/43/44）。
+> 全部数字来自实际运行（80 轮，种子 42/43/44）。主体批次为 `sup80v2`；
+> CIFAR-10 的 `dm_multi`/`gcr` 只有 `sup80v3` 批次（像素对照同批次），
+> 已在主表逐行标注。
 > 主表由 `experiments/make_report.py` 生成：
-> `results/cifar10/main_table_multi_seed_v2.md` 与
 > `results/cifar100/main_table_multi_seed_v2.md`；
-> 逐种子明细在 `results/<dataset>/iid/*_sup80v2_seed*.json`。
+> CIFAR-10 的 `main_table_multi_seed_v2.md` 以脚本输出为基础合并两个批次
+> （脚本每次只处理一个 tag），并逐行标注批次；
+> 逐种子明细在 `results/<dataset>/iid/*_sup80v{2,3}_seed*.json`。
 > 所有方法共享同一 Initial Base VAE、同一数据流与同一云端协议。
 > 潜空间 vs 原始像素的对照（`representation=pixel`）见
-> `results/pixel_vs_vae_comparison.md`。
+> `results/pixel_vs_vae_comparison.md`，逐 seed 配对校验见
+> `results/pixel_vs_vae_per_seed.md`（由
+> `python -m vae_streaming.experiments.verify_pixel_vs_vae` 生成）。
+> pixel 结果与断点分别写入 `results/<dataset>/pixel/...` 与
+> `checkpoints/<dataset>/pixel/...`，VAE 保留旧路径。
 
 ### 5.1 CIFAR-10，IID，80 轮，预算 980（最终 50:1），3 seeds
+
+> 批次：`dm_multi`/`gcr` 为 `sup80v3`，其余为 `sup80v2`；Pixel 配对固定用
+> `sup80v3`（见 5.3）。同一方法在不同批次的数字不混用。
 
 | 方法 | 种子 | 初始 | 最终 | 在线平均 | 最终 F1 | INT8 | 累计通信 | 方差比 | 对齐误差 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -255,7 +267,11 @@ python -m vae_streaming.experiments.run_offline_reference \
 2. **CIFAR-10 第二梯队密集**：gcr（80.08）、reservoir_latent（79.66）、
    dm_multi（79.64）、dm（79.51）、kip（79.37）差距在 0.8 点内；
    CIFAR-100 上 DM 系（37.36 / 37.07）明显强于质心类方法（32–33）。
-3. **INT8 几乎无损**：所有方法的 INT8 与 FP32 最终精度差 ≤ 0.3 点。
+3. **INT8 列的口径**：云端模型在 INT8 回传特征上训练，INT8 列只把测试输入
+   再量化。按 seed 平均，三种核心方法（dm / exstream / online_reservoir）
+   在两个数据集、两种表示上的末轮差最大 0.04 pp（逐 seed 最大 0.08 pp）；
+   C10 KIP 0.44、C100 KIP 0.48、
+   C100 K-means 0.65，不能概括为“所有方法 ≤0.3 点”。
 4. **通信完全一致**：主口径均为 full sync，80 轮累计 80,498 KB（约 78.6 MB），
    因此方法间差异只来自代表集构建与蒸馏，不来自通信预算。
 5. **方差比呈方法特征**：Moment 恒为 1.000（解析校准）；K-means 强烈收缩
@@ -268,7 +284,7 @@ python -m vae_streaming.experiments.run_offline_reference \
 
 ## 6. 测试覆盖
 
-当前测试：`python -m pytest vae_streaming/tests -q` → **52 passed, 1 skipped**。
+当前测试：`python -m pytest vae_streaming/tests -q` → **63 passed, 1 skipped**。
 
 | # | 检查 | 测试 |
 |---|---|---|
@@ -380,6 +396,22 @@ python -m vae_streaming.experiments.run_offline_reference \
 
 ---
 
+### 2026-11-26 第五轮审计（表示隔离与配对校验）
+
+| 编号 | 问题 | 修复 |
+|---|---|---|
+| C1 | 同方法/seed 无 tag 时 Pixel 与 VAE 覆盖同一 JSON/断点 | 路径加入 representation；写前检查已有文件/断点表示，不一致直接报错 |
+| C2 | 旧监督断点缺 `allow_stream_ground_truth`，恢复后拒绝合法监督样本 | `from_state_dict` 用已校验 `label_mode` 补齐；公共 Replay 与独立 Reservoir 都处理 |
+| C3 | 汇总把文件数当 seed 数，Pixel/VAE 被混在一起平均 | 按 (dataset, method, representation, seed) 唯一性校验并分表示汇总 |
+| C4 | 流指纹只哈希拼接索引，不同轮切分可由同一指纹 | 指纹纳入每轮长度并写 `stream_sha1_version=2`；旧断点/旧 JSON 按 legacy（v1）兼容校验，验证脚本只在同一代内比较 |
+| C5 | 无法逐 seed 复核 Pixel/VAE 配对 | 新增 `verify_pixel_vs_vae.py`，输出两侧 tag、末轮、在线平均与配对差 |
+| C6 | INT8“所有方法 ≤0.3 点”与主表矛盾 | 改为核心三方法 seed 平均最大 0.04 pp（逐 seed 最大 0.08 pp） |
+| C7 | `edge_total_sec` 在 Base 命中缓存时不计 Base 训练 | 新增 `edge_base_build_sec`（续跑从断点恢复）与 `edge_online_sec`，论文分开报告 |
+| C8 | 验证 KL 沿通道求和，与训练差 16 倍 | 验证改为 `kl.mean()` |
+| C9 | `--representation pixel` 默认方法含不支持的 online_kmeans | pixel 默认 `dm,exstream,online_reservoir` |
+
+---
+
 ## 8. 已知限制
 
 1. **20% Base 是共同瓶颈**：初始 VAE 只见过约 9,800 张图，特征质量明显弱于
@@ -405,3 +437,8 @@ python -m vae_streaming.experiments.run_offline_reference \
     但当前只保留 IID 主表；引用这两个场景前需重新运行。
 12. **reencode + patch 组合被显式拒绝**：两者对代表集语义冲突，
     如需该组合必须先定义新的协议。
+13. **旧结果/断点兼容**：VAE 继续读旧路径；旧断点没有 `representation`
+    字段时按 `protocol_mean` 维度推断；旧断点/旧 JSON 的流指纹按 legacy（v1）
+    兼容校验，新结果写 `stream_sha1_version=2`；验证脚本只在同一代内比较指纹。
+14. **KL 曲线断代**：旧 JSON 的验证 KL 是沿通道求和口径（约为训练口径的
+    16 倍，对应 16 个潜通道），不能与新结果直接比较；分类准确率不受影响。

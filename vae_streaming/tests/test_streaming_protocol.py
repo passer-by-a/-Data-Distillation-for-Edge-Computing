@@ -1105,5 +1105,85 @@ def test_cifar100_class_count_contracts():
     assert out.shape == (2, 100)
 
 
+# ======================================================================
+# 32. 表示隔离、旧断点兼容与报告聚合
+# ======================================================================
+def test_replay_restores_legacy_supervised_state():
+    buf = ClassBalancedReservoir(6, 3, allow_stream_ground_truth=True)
+    x, y = _images(6, num_classes=3)
+    buf.add_batch(x, y, round_idx=-1, source="base")
+    st = buf.state_dict()
+    st.pop("allow_stream_ground_truth")
+    restored = ClassBalancedReservoir.from_state_dict(
+        st, allow_stream_ground_truth=True)
+    assert restored.allow_stream_ground_truth
+    # 旧断点恢复后，合法监督样本仍可写入
+    restored.add_batch(x[:1], y[:1], round_idx=0, source="stream",
+                       label_source="ground_truth")
+
+
+def test_stream_fingerprint_includes_round_boundaries():
+    a = CausalStream.__new__(CausalStream)
+    b = CausalStream.__new__(CausalStream)
+    a.round_indices = [np.array([1, 2]), np.array([3])]
+    b.round_indices = [np.array([1]), np.array([2, 3])]
+    assert a.stream_indices_sha1() != b.stream_indices_sha1()
+    # 旧指纹只看拼接索引，两种切分相同（因此不能再用它做严格校验）
+    assert a.stream_indices_sha1_legacy() == b.stream_indices_sha1_legacy()
+
+
+def _report_obj(method, seed, rep, acc):
+    return {
+        "summary": {"scenario": "iid", "method": method, "seed": seed,
+                    "representation": rep, "num_rounds": 80,
+                    "initial_acc": 10.0, "final_acc": acc,
+                    "avg_online_acc": acc, "final_f1": acc,
+                    "final_test_int8_acc": acc,
+                    "cumulative_upload_bytes": 1024,
+                    "sync_mode": "full_sync", "n_reps": 980},
+        "rounds": [{"acc": acc}],
+        "_path": f"{method}-{rep}-{seed}.json",
+    }
+
+
+def test_report_keeps_representations_separate():
+    from vae_streaming.experiments.make_report import aggregate
+    objs = [_report_obj("dm", 42, "pixel", 36.0),
+            _report_obj("dm", 42, "vae", 80.0)]
+    rows = aggregate(objs, "iid")
+    assert len(rows) == 2
+    assert {r["representation"] for r in rows} == {"pixel", "vae"}
+    assert all(r["seeds"] == 1 for r in rows)
+
+
+def test_report_rejects_duplicate_seed():
+    from vae_streaming.experiments.make_report import aggregate
+    objs = [_report_obj("dm", 42, "vae", 80.0),
+            _report_obj("dm", 42, "vae", 81.0)]
+    with pytest.raises(ValueError):
+        aggregate(objs, "iid")
+
+
+def test_representation_paths_and_conflict_guard(tmp_path):
+    from vae_streaming.experiments.engine import (
+        _check_result_representation, _repr_relpath)
+    assert _repr_relpath("cifar10/iid/dm_seed42.json", "vae") == \
+        "cifar10/iid/dm_seed42.json"
+    assert _repr_relpath("cifar10/iid/dm_seed42.json", "pixel") == \
+        "cifar10/pixel/iid/dm_seed42.json"
+    p = tmp_path / "result.json"
+    p.write_text(json.dumps({"summary": {"representation": "pixel"}}))
+    with pytest.raises(ValueError):
+        _check_result_representation(str(p), "vae")
+    _check_result_representation(str(p), "pixel")
+
+
+def test_state_representation_detection():
+    from vae_streaming.experiments.engine import _state_representation
+    assert _state_representation({"representation": "pixel"}) == "pixel"
+    assert _state_representation({"protocol_mean": torch.zeros(3)}) == "pixel"
+    assert _state_representation({"protocol_mean": torch.zeros(1024)}) == "vae"
+
+
 
 

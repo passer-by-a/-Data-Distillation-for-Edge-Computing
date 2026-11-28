@@ -59,7 +59,7 @@ class IncrementalCloudLearner:
 
     # ------------------------------------------------------------------
     def update(self, features, labels, val_features=None, val_labels=None,
-               round_idx=0, mode="incremental"):
+               round_idx=0, mode="incremental", on_epoch_end=None):
         self._ensure()
         if mode == "scratch":
             self.model, self.opt = self._build(self.seed + int(round_idx))
@@ -94,15 +94,16 @@ class IncrementalCloudLearner:
                 if (xv is not None and xv.numel() * xv.element_size()
                         <= max_bytes):
                     dev_xv = xv.to(self.device)
-            batches = None
+            batches, epoch_ends = None, []
             if self.epochs_per_round > 0:
                 # 固定 5 个 epoch：每轮完整遍历当前同步集，最后不足一个
-                # batch 的尾批也参与更新
+                # batch 的尾批也参与更新；epoch_ends 记录每个 epoch 的结束步
                 batches = []
                 for _ in range(self.epochs_per_round):
                     perm = torch.randperm(len(x), generator=g)
                     for i in range(0, len(x), self.batch):
                         batches.append(perm[i:i + self.batch])
+                    epoch_ends.append(len(batches))
                 steps = len(batches)
             else:
                 steps = self.steps_per_round
@@ -133,6 +134,11 @@ class IncrementalCloudLearner:
                     best_step = int(step)
 
             self.model.train()
+            loss_sum, n_loss = 0.0, 0
+            ep_sum, ep_n = 0.0, 0
+            epoch_losses = []
+            ep_pos = 0
+            next_ep_end = epoch_ends[0] if epoch_ends else -1
             for step in range(1, steps + 1):
                 if batches is None:
                     idx = torch.randint(0, len(x), (min(self.batch, len(x)),),
@@ -142,10 +148,24 @@ class IncrementalCloudLearner:
                 xb = dev_x[idx] if dev_x is not None else x[idx].to(self.device)
                 yb = dev_y[idx] if dev_y is not None else y[idx].to(self.device)
                 loss = F.cross_entropy(self.model(xb), yb)
+                loss_sum += float(loss.item()) * len(xb)
+                n_loss += len(xb)
+                ep_sum += float(loss.item()) * len(xb)
+                ep_n += len(xb)
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 self.opt.step()
                 sch.step()
+                if step == next_ep_end:
+                    # 该 epoch 的训练 CE（按样本加权）；回调可做逐 epoch 只读评估
+                    epoch_losses.append(ep_sum / max(1, ep_n))
+                    if on_epoch_end is not None:
+                        on_epoch_end(int(ep_pos), float(epoch_losses[-1]))
+                        self.model.train()
+                    ep_sum, ep_n = 0.0, 0
+                    ep_pos += 1
+                    next_ep_end = (epoch_ends[ep_pos]
+                                   if ep_pos < len(epoch_ends) else -1)
                 if step % val_every == 0 or step == steps:
                     _validate(step)
                     self.model.train()
@@ -169,6 +189,8 @@ class IncrementalCloudLearner:
                 "total_train_sec": self.total_train_sec,
                 "best_val_acc": None if best_acc < 0 else float(best_acc),
                 "best_step": int(best_step),
+                "train_loss": float(loss_sum / max(1, n_loss)),
+                "epoch_train_loss": epoch_losses,
                 "optimizer_steps_total": int(self.steps_done),
                 "head": self.head,
                 "param_norm": float(sum(p.detach().pow(2).sum()
@@ -178,8 +200,26 @@ class IncrementalCloudLearner:
 
     # ------------------------------------------------------------------
     def evaluate(self, features, labels):
-        return evaluate_cloud_classifier(self.model, features, labels,
-                                         self.num_classes)
+        out = evaluate_cloud_classifier(self.model, features, labels,
+                                        self.num_classes)
+        out["loss"] = self._cross_entropy(features, labels)
+        return out
+
+    @torch.no_grad()
+    def _cross_entropy(self, features, labels, batch=512):
+        """当前云端分类器在给定特征上的平均交叉熵（评估用）。"""
+        dev = next(self.model.parameters()).device
+        x = features.float()
+        y = labels.long()
+        total, n = 0.0, 0
+        self.model.eval()
+        for i in range(0, x.size(0), batch):
+            xb = x[i:i + batch].to(dev)
+            yb = y[i:i + batch].to(dev)
+            total += float(F.cross_entropy(self.model(xb), yb,
+                                           reduction="sum").item())
+            n += int(yb.numel())
+        return total / max(1, n)
 
     def state_dict(self):
         return {"model": copy.deepcopy(self.model.state_dict())

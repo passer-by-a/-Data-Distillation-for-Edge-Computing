@@ -137,11 +137,22 @@ class ClassBalancedReservoir:
                 "per_class": list(self.buffers)}
 
     @classmethod
-    def from_state_dict(cls, st):
+    def from_state_dict(cls, st, allow_stream_ground_truth=None):
+        """从断点恢复。
+
+        旧断点没有 allow_stream_ground_truth 字段，直接回退 False 会让
+        有监督协议在恢复后拒绝合法的流式真实标签。此时优先使用调用方
+        根据已校验 label_mode 推导出的值（allow_stream_ground_truth）。
+        """
+        if "allow_stream_ground_truth" in st:
+            allow = bool(st["allow_stream_ground_truth"])
+        elif allow_stream_ground_truth is not None:
+            allow = bool(allow_stream_ground_truth)
+        else:
+            allow = False
         obj = cls(st["capacity"], st["num_classes"],
                   class_balanced=st["class_balanced"], seed=0,
-                  allow_stream_ground_truth=st.get(
-                      "allow_stream_ground_truth", False))
+                  allow_stream_ground_truth=allow)
         obj.caps = list(st["caps"])
         obj.seen = np.asarray(st["seen"]).copy()
         obj.rng.set_state(st["rng_state"])

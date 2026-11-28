@@ -9,7 +9,9 @@ def build_parser(default_scenario, default_methods):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="vae_streaming/configs/cifar100.yaml")
     ap.add_argument("--scenario", default=default_scenario)
-    ap.add_argument("--methods", default=",".join(default_methods))
+    ap.add_argument("--methods", default=None,
+                    help="逗号分隔的方法名；未指定时 vae 用脚本默认方法，"
+                         "pixel 用 dm,exstream,online_reservoir")
     ap.add_argument("--seeds", default="42")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--budget", type=int, default=None)
@@ -104,7 +106,14 @@ def run_cli(default_scenario, default_methods):
     if args.representation is not None:
         cfg["representation"] = args.representation
 
-    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    if args.methods is None:
+        # pixel 不支持 online_kmeans / online_moment / kip，默认只跑主对照
+        if str(cfg.get("representation", "vae")) == "pixel":
+            methods = ["dm", "exstream", "online_reservoir"]
+        else:
+            methods = list(default_methods)
+    else:
+        methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     results = []
     for seed in seeds:
